@@ -1,0 +1,48 @@
+# IMARA-CARE API
+
+The FastAPI backend for the IMARA-CARE hospital management MVP. It implements patient registration and search, duplicate checks, appointment booking, visit check-in, triage, department queues, and audit events.
+
+## Requirements
+
+- Python 3.12 or later
+- PostgreSQL 16 for a shared environment, or SQLite for the local demo
+
+## Local setup (Windows PowerShell)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+uvicorn app.main:app --reload
+```
+
+The API and interactive docs are available at [http://localhost:8000](http://localhost:8000) and [http://localhost:8000/docs](http://localhost:8000/docs). By default, the API creates `imara-care.db` in the current directory and seeds the configured facility and its departments.
+
+Set `DATABASE_URL` in `.env` to use PostgreSQL:
+
+```text
+DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/imara_care
+```
+
+Set `FACILITY_NAME`, `FACILITY_CODE`, and `FRONTEND_ORIGIN` to configure the local facility and browser origin. Never commit `.env` files or real credentials.
+
+## Tests
+
+```powershell
+python -m pytest -q
+```
+
+## API areas
+
+- `GET /api/v1/health`, `GET /api/v1/facility`, `GET /api/v1/dashboard`
+- `GET|POST /api/v1/patients`, `GET /api/v1/patients/{patient_id}`
+- `GET|POST /api/v1/appointments`, `PATCH /api/v1/appointments/{appointment_id}`
+- `POST /api/v1/visits/checkin`
+- `GET /api/v1/queues`, `POST /api/v1/queues/{entry_id}/call`, `POST /api/v1/queues/call-next`
+- `POST /api/v1/triage/{visit_id}`
+- `GET /api/v1/audit`
+
+## Important limitations
+
+This is an early development/demo MVP. Authentication, server-enforced role permissions, PostgreSQL row-level tenant isolation, database migrations, and the remaining clinical, laboratory, pharmacy, theatre, and billing workflows are not implemented. Do not use real patient information or expose the development API to the internet.
