@@ -25,6 +25,7 @@ from app.schemas import (
     PatientRead,
     TriageCreate,
 )
+from app.security import StaffAuthenticationMiddleware
 
 
 DEFAULT_DEPARTMENTS = [
@@ -118,6 +119,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(StaffAuthenticationMiddleware)
 
 
 @app.on_event("startup")

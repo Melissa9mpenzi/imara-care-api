@@ -7,6 +7,8 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import get_db
 from app import main
+from app import security
+from app.config import settings
 
 
 @pytest.fixture
@@ -23,11 +25,33 @@ def client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
 
     monkeypatch.setattr(main, "engine", test_engine)
     monkeypatch.setattr(main, "SessionLocal", test_session_factory)
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {"sub": "test-staff", "facilityId": settings.facility_code},
+    )
     main.app.dependency_overrides[get_db] = override_get_db
     with TestClient(main.app) as test_client:
+        test_client.headers["Authorization"] = "Bearer test-token"
         yield test_client
     main.app.dependency_overrides.clear()
     test_engine.dispose()
+
+
+def test_health_is_public_but_staff_api_requires_a_facility_session(client: TestClient):
+    client.headers.pop("Authorization")
+    assert client.get("/api/v1/health").status_code == 200
+    assert client.get("/api/v1/facility").status_code == 401
+
+
+def test_staff_session_cannot_access_another_facility(client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {"sub": "test-staff", "facilityId": "OTHER"},
+    )
+    response = client.get("/api/v1/facility")
+    assert response.status_code == 403
 
 
 def register_patient(client: TestClient) -> dict:

@@ -25,7 +25,7 @@ Set `DATABASE_URL` in `.env` to use PostgreSQL:
 DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/imara_care
 ```
 
-Set `FACILITY_NAME`, `FACILITY_CODE`, and `FRONTEND_ORIGIN` to configure the local facility and browser origin. Never commit `.env` files or real credentials.
+Set `FACILITY_NAME`, `FACILITY_CODE`, `FRONTEND_ORIGIN`, `AUTH_ISSUER`, and `AUTH_JWKS_URL` to configure the local facility, browser origin, and Better Auth token verification. Keep `AUTH_ISSUER` and `AUTH_JWKS_URL` aligned with the frontend's `BETTER_AUTH_URL`. Never commit `.env` files or real credentials.
 
 ## Tests
 
@@ -45,4 +45,4 @@ python -m pytest -q
 
 ## Important limitations
 
-This is an early development/demo MVP. Authentication, server-enforced role permissions, PostgreSQL row-level tenant isolation, database migrations, and the remaining clinical, laboratory, pharmacy, theatre, and billing workflows are not implemented. Do not use real patient information or expose the development API to the internet.
+This is an early development/demo MVP. The API requires a Better Auth bearer token scoped to the configured facility, but role-based endpoint permissions, MFA, social sign-in, passkeys, multi-facility routing, PostgreSQL row-level tenant isolation, database migrations, and the remaining clinical, laboratory, pharmacy, theatre, and billing workflows are not implemented. Do not use real patient information or expose the development API to the internet.
