@@ -27,6 +27,8 @@ DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/imara_care
 
 Set `FACILITY_NAME`, `FACILITY_CODE`, `FRONTEND_ORIGIN`, `AUTH_ISSUER`, and `AUTH_JWKS_URL` to configure the local facility, browser origin, and Better Auth token verification. Keep `AUTH_ISSUER` and `AUTH_JWKS_URL` aligned with the frontend's `BETTER_AUTH_URL`. Never commit `.env` files or real credentials.
 
+The API rejects clinical data access for platform administrators, facility administrators, medical directors, clinicians, and pharmacists until the signed-in staff account has completed authenticator-app MFA enrollment. MFA verification and recovery-code handling are provided by the frontend Better Auth service.
+
 ## Tests
 
 ```powershell
@@ -45,4 +47,4 @@ python -m pytest -q
 
 ## Important limitations
 
-This is an early development/demo MVP. The API requires a Better Auth bearer token scoped to the configured facility, but role-based endpoint permissions, MFA, social sign-in, passkeys, multi-facility routing, PostgreSQL row-level tenant isolation, database migrations, and the remaining clinical, laboratory, pharmacy, theatre, and billing workflows are not implemented. Do not use real patient information or expose the development API to the internet.
+This is an early development/demo MVP. The API requires a Better Auth bearer token scoped to the configured facility and enforces MFA enrollment for sensitive staff roles. Fine-grained role-based endpoint permissions, social sign-in, passkeys, multi-facility routing, PostgreSQL row-level tenant isolation, database migrations, and the remaining clinical, laboratory, pharmacy, theatre, and billing workflows are not implemented. Do not use real patient information or expose the development API to the internet.

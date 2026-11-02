@@ -54,6 +54,58 @@ def test_staff_session_cannot_access_another_facility(client: TestClient, monkey
     assert response.status_code == 403
 
 
+@pytest.mark.parametrize(
+    "staff_role",
+    ["admin", "facility_admin", "medical_director", "clinician", "pharmacist"],
+)
+def test_roles_requiring_mfa_cannot_access_api_before_setup(
+    client: TestClient,
+    monkeypatch,
+    staff_role: str,
+):
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {
+            "sub": "test-staff",
+            "facilityId": settings.facility_code,
+            "staffRole": staff_role,
+            "mfa": False,
+        },
+    )
+    response = client.get("/api/v1/facility")
+    assert response.status_code == 403
+    assert "authenticator" in response.json()["detail"]
+
+
+def test_mfa_enabled_staff_role_can_access_api(client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {
+            "sub": "test-staff",
+            "facilityId": settings.facility_code,
+            "staffRole": "clinician",
+            "mfa": True,
+        },
+    )
+    assert client.get("/api/v1/facility").status_code == 200
+
+
+def test_other_staff_roles_do_not_require_mfa_by_default(client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {
+            "sub": "test-staff",
+            "facilityId": settings.facility_code,
+            "staffRole": "reception",
+            "mfa": False,
+        },
+    )
+    assert client.get("/api/v1/facility").status_code == 200
+
+
 def register_patient(client: TestClient) -> dict:
     response = client.post(
         "/api/v1/patients",

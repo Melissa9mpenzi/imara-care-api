@@ -10,6 +10,14 @@ from starlette.responses import Response
 
 from app.config import settings
 
+MFA_REQUIRED_ROLES = {
+    "admin",
+    "facility_admin",
+    "medical_director",
+    "clinician",
+    "pharmacist",
+}
+
 
 @lru_cache(maxsize=1)
 def get_jwks_client() -> PyJWKClient:
@@ -70,8 +78,15 @@ class StaffAuthenticationMiddleware(BaseHTTPMiddleware):
                 content={"detail": "This account cannot access this facility."},
             )
 
+        staff_role = claims.get("staffRole", "staff")
+        if staff_role in MFA_REQUIRED_ROLES and claims.get("mfa") is not True:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Set up an authenticator app before accessing staff data."},
+            )
+
         request.state.staff_user = {
             "id": claims["sub"],
-            "role": claims.get("staffRole", "staff"),
+            "role": staff_role,
         }
         return await call_next(request)
