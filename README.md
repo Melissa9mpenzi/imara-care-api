@@ -27,6 +27,8 @@ DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/imara_care
 
 Set `FACILITY_NAME`, `FACILITY_CODE`, `FRONTEND_ORIGIN`, `AUTH_ISSUER`, and `AUTH_JWKS_URL` to configure the local facility, browser origin, and Better Auth token verification. Keep `AUTH_ISSUER` and `AUTH_JWKS_URL` aligned with the frontend's `BETTER_AUTH_URL`. Never commit `.env` files or real credentials.
 
+For the shared local PostgreSQL service and Prisma-authored foundation tables, follow the PostgreSQL setup in `web/README.md`. The FastAPI models continue to manage clinical tables using SQLAlchemy; the Prisma schema owns the auth, tenant, role, permission, and audit foundation.
+
 The API rejects clinical data access for platform administrators, facility administrators, medical directors, clinicians, and pharmacists until the signed-in staff account has completed authenticator-app MFA enrollment. MFA verification and recovery-code handling are provided by the frontend Better Auth service.
 
 ## Tests
