@@ -197,3 +197,85 @@ class AuditEvent(Base):
     entity_id: Mapped[str] = mapped_column(String(36), nullable=False)
     details: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+    __table_args__ = (
+        Index("ix_reminder_owner_status_due", "owner_id", "status", "due_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(500))
+    link_type: Mapped[str | None] = mapped_column(String(32))
+    link_id: Mapped[str | None] = mapped_column(String(128))
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    repeat_frequency: Mapped[str] = mapped_column(String(16), default="none", nullable=False)
+    repeat_interval: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    repeat_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    alert_offsets: Mapped[list[int]] = mapped_column(JSON, default=lambda: [0], nullable=False)
+    priority: Mapped[str] = mapped_column(String(16), default="normal", nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="scheduled", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+    occurrences: Mapped[list["ReminderOccurrence"]] = relationship(
+        back_populates="reminder", cascade="all, delete-orphan"
+    )
+
+
+class ReminderOccurrence(Base):
+    __tablename__ = "reminder_occurrences"
+    __table_args__ = (
+        UniqueConstraint(
+            "reminder_id", "fire_at", "alert_offset_minutes",
+            name="uq_reminder_occurrence_fire_offset",
+        ),
+        Index("ix_reminder_occurrence_pending", "status", "fire_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    reminder_id: Mapped[str] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), index=True
+    )
+    fire_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    alert_offset_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    reminder: Mapped[Reminder] = relationship(back_populates="occurrences")
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    __table_args__ = (
+        Index("ix_notification_recipient_status_created", "recipient_user_id", "status", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    recipient_user_id: Mapped[str] = mapped_column(String(128), index=True)
+    reminder_occurrence_id: Mapped[str | None] = mapped_column(
+        ForeignKey("reminder_occurrences.id", ondelete="SET NULL"), unique=True
+    )
+    type: Mapped[str] = mapped_column(String(48), nullable=False)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    body: Mapped[str] = mapped_column(String(500), nullable=False)
+    link_type: Mapped[str | None] = mapped_column(String(32))
+    link_id: Mapped[str | None] = mapped_column(String(128))
+    priority: Mapped[str] = mapped_column(String(16), default="normal", nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="unread", nullable=False)
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    reminder_occurrence: Mapped[ReminderOccurrence | None] = relationship()

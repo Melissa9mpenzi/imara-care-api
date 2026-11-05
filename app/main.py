@@ -1,6 +1,6 @@
 from datetime import date, datetime, time, timedelta, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm import Session, joinedload
@@ -22,9 +22,12 @@ from app.schemas import (
     AppointmentStatusUpdate,
     CheckInCreate,
     PatientCreate,
+    PatientDetail,
     PatientRead,
+    PatientUpdate,
     TriageCreate,
 )
+from app.reminders import router as reminders_router
 from app.security import StaffAuthenticationMiddleware
 
 
@@ -120,6 +123,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(StaffAuthenticationMiddleware)
+app.include_router(reminders_router)
 
 
 @app.on_event("startup")
@@ -155,6 +159,7 @@ def patient_summary(patient: Patient) -> dict:
         "usual_payment_method": patient.usual_payment_method,
         "allergies": patient.allergies,
         "sms_consent": patient.sms_consent,
+        "status": patient.status,
         "created_at": patient.created_at.isoformat() if patient.created_at else None,
     }
 
@@ -362,13 +367,13 @@ def search_patients(
     q: str = Query(default="", max_length=120),
     limit: int = Query(default=30, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    include_archived: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
     facility = get_facility(db)
-    query = select(Patient).where(
-        Patient.facility_id == facility.id,
-        Patient.status == "active",
-    )
+    query = select(Patient).where(Patient.facility_id == facility.id)
+    if not include_archived:
+        query = query.where(Patient.status == "active")
     if q.strip():
         term = f"%{q.strip()}%"
         query = query.where(
@@ -449,7 +454,6 @@ def read_patient(patient_id: str, db: Session = Depends(get_db)):
         select(Patient).where(
             Patient.id == patient_id,
             Patient.facility_id == facility.id,
-            Patient.status == "active",
         )
     )
     if patient is None:
@@ -462,7 +466,7 @@ def read_patient(patient_id: str, db: Session = Depends(get_db)):
         .limit(20)
     ).all()
     return {
-        "patient": patient_summary(patient),
+        "patient": PatientDetail.model_validate(patient).model_dump(mode="json"),
         "visits": [
             {
                 "id": visit.id,
@@ -476,6 +480,146 @@ def read_patient(patient_id: str, db: Session = Depends(get_db)):
             for visit in visits
         ],
     }
+
+
+@app.patch("/api/v1/patients/{patient_id}", response_model=PatientDetail)
+def update_patient(
+    patient_id: str,
+    payload: PatientUpdate,
+    db: Session = Depends(get_db),
+):
+    facility = get_facility(db)
+    patient = db.scalar(
+        select(Patient).where(
+            Patient.id == patient_id,
+            Patient.facility_id == facility.id,
+        )
+    )
+    if patient is None:
+        raise HTTPException(status_code=404, detail="Patient not found.")
+
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Provide at least one patient field to update.")
+
+    candidate = {
+        field: getattr(patient, field)
+        for field in PatientCreate.model_fields
+    }
+    candidate.update({key: value for key, value in changes.items() if key != "status"})
+    try:
+        validated = PatientCreate.model_validate(candidate)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if patient.status == "active":
+        duplicate_checks = []
+        if validated.phone:
+            duplicate_checks.append(Patient.phone == validated.phone)
+        if validated.date_of_birth:
+            duplicate_checks.append(
+                (func.lower(Patient.first_name) == validated.first_name.lower())
+                & (func.lower(Patient.last_name) == validated.last_name.lower())
+                & (Patient.date_of_birth == validated.date_of_birth)
+            )
+        if duplicate_checks:
+            duplicate = db.scalar(
+                select(Patient)
+                .where(
+                    Patient.facility_id == facility.id,
+                    Patient.status == "active",
+                    Patient.id != patient.id,
+                    or_(*duplicate_checks),
+                )
+                .limit(1)
+            )
+            if duplicate:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "possible_duplicate",
+                        "message": "Another active patient has the same phone number or name and date of birth.",
+                        "patient": patient_summary(duplicate),
+                    },
+                )
+
+    previous_status = patient.status
+    for field, value in validated.model_dump().items():
+        setattr(patient, field, value)
+    if "status" in changes:
+        if changes["status"] == "inactive" and previous_status != "inactive":
+            open_visit = db.scalar(
+                select(Visit.id).where(
+                    Visit.facility_id == facility.id,
+                    Visit.patient_id == patient.id,
+                    Visit.status.in_(OPEN_VISIT_STATUSES),
+                ).limit(1)
+            )
+            if open_visit:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A patient with an active visit cannot be archived.",
+                )
+        patient.status = changes["status"]
+
+    action = (
+        "patient.archived"
+        if patient.status == "inactive" and previous_status != "inactive"
+        else "patient.restored"
+        if patient.status == "active" and previous_status == "inactive"
+        else "patient.updated"
+    )
+    audit(
+        db,
+        facility.id,
+        action,
+        "patient",
+        patient.id,
+        {"patient_number": patient.patient_number},
+    )
+    db.commit()
+    db.refresh(patient)
+    return patient
+
+
+@app.delete("/api/v1/patients/{patient_id}")
+def archive_patient(patient_id: str, db: Session = Depends(get_db)):
+    facility = get_facility(db)
+    patient = db.scalar(
+        select(Patient).where(
+            Patient.id == patient_id,
+            Patient.facility_id == facility.id,
+        )
+    )
+    if patient is None:
+        raise HTTPException(status_code=404, detail="Patient not found.")
+    if patient.status == "inactive":
+        raise HTTPException(status_code=409, detail="Patient is already archived.")
+
+    open_visit = db.scalar(
+        select(Visit.id).where(
+            Visit.facility_id == facility.id,
+            Visit.patient_id == patient.id,
+            Visit.status.in_(OPEN_VISIT_STATUSES),
+        ).limit(1)
+    )
+    if open_visit:
+        raise HTTPException(
+            status_code=409,
+            detail="A patient with an active visit cannot be archived.",
+        )
+
+    patient.status = "inactive"
+    audit(
+        db,
+        facility.id,
+        "patient.archived",
+        "patient",
+        patient.id,
+        {"patient_number": patient.patient_number},
+    )
+    db.commit()
+    return {"id": patient.id, "status": patient.status}
 
 
 @app.get("/api/v1/appointments")

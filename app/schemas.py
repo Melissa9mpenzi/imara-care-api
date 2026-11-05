@@ -34,6 +34,27 @@ class PatientCreate(BaseModel):
         return self
 
 
+class PatientUpdate(BaseModel):
+    first_name: str | None = Field(default=None, min_length=1, max_length=80)
+    last_name: str | None = Field(default=None, min_length=1, max_length=80)
+    other_names: str | None = Field(default=None, max_length=120)
+    sex: Literal["female", "male", "other", "not_specified"] | None = None
+    date_of_birth: date | None = None
+    estimated_age: int | None = Field(default=None, ge=0, le=125)
+    phone: str | None = Field(default=None, max_length=32)
+    alt_phone: str | None = Field(default=None, max_length=32)
+    email: EmailStr | None = None
+    national_id: str | None = Field(default=None, max_length=64)
+    address: str | None = Field(default=None, max_length=240)
+    next_of_kin_name: str | None = Field(default=None, max_length=160)
+    next_of_kin_relationship: str | None = Field(default=None, max_length=80)
+    next_of_kin_phone: str | None = Field(default=None, max_length=32)
+    usual_payment_method: PaymentMethod | None = None
+    allergies: list[str] | None = Field(default=None, max_length=20)
+    sms_consent: bool | None = None
+    status: Literal["active", "inactive"] | None = None
+
+
 class PatientRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -51,7 +72,17 @@ class PatientRead(BaseModel):
     usual_payment_method: str
     allergies: list[str]
     sms_consent: bool
+    status: str
     created_at: datetime
+
+
+class PatientDetail(PatientRead):
+    alt_phone: str | None
+    national_id: str | None
+    next_of_kin_name: str | None
+    next_of_kin_relationship: str | None
+    next_of_kin_phone: str | None
+    updated_at: datetime
 
 
 class AppointmentCreate(BaseModel):

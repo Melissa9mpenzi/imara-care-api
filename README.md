@@ -19,17 +19,43 @@ uvicorn app.main:app --reload
 
 The API and interactive docs are available at [http://localhost:8000](http://localhost:8000) and [http://localhost:8000/docs](http://localhost:8000/docs). By default, the API creates `imara-care.db` in the current directory and seeds the configured facility and its departments.
 
-Set `DATABASE_URL` in `.env` to use PostgreSQL:
+The following connection example is for the project's Docker database; for a standalone PostgreSQL Server, follow the setup below:
 
 ```text
 DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/imara_care
 ```
+
+Install and start PostgreSQL Server; pgAdmin is only the management app and cannot host the database by itself. In pgAdmin, connect to the local server (usually `localhost`, port `5432`) using the username and password set during installation. Right-click **Databases** > **Create** > **Database** and name it `imara-caree`.
+
+For this setup, use a URL like `postgresql+psycopg://postgres:URL_ENCODED_PASSWORD@localhost:5432/imara-caree` for `DATABASE_URL` in `backend/.env`. Replace the username and password with the values from your PostgreSQL Server installation. URL-encode special characters in the password.
+
+Keep the existing SQLite file as a backup. From the `backend` directory, copy its clinical data into the new, empty PostgreSQL database:
+
+```powershell
+python -m app.migrate_sqlite_to_postgres
+```
+
+The migration creates the clinical tables and copies their records; it refuses to run if the destination database already contains tables. After a successful migration, the API uses PostgreSQL through `DATABASE_URL`. The separate `web/imara-care-auth.db` login database is not migrated by this command.
 
 Set `FACILITY_NAME`, `FACILITY_CODE`, `FRONTEND_ORIGIN`, `AUTH_ISSUER`, and `AUTH_JWKS_URL` to configure the local facility, browser origin, and Better Auth token verification. Keep `AUTH_ISSUER` and `AUTH_JWKS_URL` aligned with the frontend's `BETTER_AUTH_URL`. Never commit `.env` files or real credentials.
 
 For the shared local PostgreSQL service and Prisma-authored foundation tables, follow the PostgreSQL setup in `web/README.md`. The FastAPI models continue to manage clinical tables using SQLAlchemy; the Prisma schema owns the auth, tenant, role, permission, and audit foundation.
 
 The API rejects clinical data access for platform administrators, facility administrators, medical directors, clinicians, and pharmacists until the signed-in staff account has completed authenticator-app MFA enrollment. MFA verification and recovery-code handling are provided by the frontend Better Auth service.
+
+## Personal reminders and notifications
+
+Staff can create private reminders from the dashboard. Reminders support one-time, daily, weekday, weekly, monthly, and every-N-days schedules, optional early alerts, and links to supported records. The API provides per-user reminder and notification lists and read/complete/cancel/snooze actions. Notification email, SMS, and browser-push delivery are not enabled.
+
+Run the reminder scheduler in a separate terminal alongside the API:
+
+```powershell
+cd C:\Users\HP\Desktop\Imara-Care\backend
+.\.venv\Scripts\Activate.ps1
+python -m app.reminder_worker
+```
+
+The worker checks due reminder occurrences once per minute, stores the notification and occurrence update together, and uses database row locking where supported so multiple PostgreSQL workers do not claim the same occurrence. With SQLite, run a single worker process. Notifications are polled by the web app; live event streaming, notification preferences, quiet hours, escalation, and delivery channels are not implemented yet.
 
 ## Tests
 
@@ -40,11 +66,13 @@ python -m pytest -q
 ## API areas
 
 - `GET /api/v1/health`, `GET /api/v1/facility`, `GET /api/v1/dashboard`
-- `GET|POST /api/v1/patients`, `GET /api/v1/patients/{patient_id}`
+- `GET|POST /api/v1/patients`, `GET|PATCH|DELETE /api/v1/patients/{patient_id}`
 - `GET|POST /api/v1/appointments`, `PATCH /api/v1/appointments/{appointment_id}`
 - `POST /api/v1/visits/checkin`
 - `GET /api/v1/queues`, `POST /api/v1/queues/{entry_id}/call`, `POST /api/v1/queues/call-next`
 - `POST /api/v1/triage/{visit_id}`
+- `GET|POST /api/v1/reminders`, `PATCH /api/v1/reminders/{reminder_id}`
+- `GET /api/v1/notifications`, `POST /api/v1/notifications/read`, `POST /api/v1/notifications/{notification_id}/snooze`
 - `GET /api/v1/audit`
 
 ## Important limitations
