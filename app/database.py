@@ -10,9 +10,20 @@ class Base(DeclarativeBase):
     pass
 
 
+def normalize_database_url(database_url: str) -> str:
+    for scheme in ("postgres://", "postgresql://"):
+        if database_url.startswith(scheme):
+            return f"postgresql+psycopg://{database_url[len(scheme):]}"
+    return database_url
+
+
 def build_engine(database_url: str = settings.database_url):
     connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
-    return create_engine(database_url, connect_args=connect_args, pool_pre_ping=True)
+    return create_engine(
+        normalize_database_url(database_url),
+        connect_args=connect_args,
+        pool_pre_ping=True,
+    )
 
 
 engine = build_engine()

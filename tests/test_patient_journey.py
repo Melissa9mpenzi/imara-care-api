@@ -6,12 +6,32 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.database import get_db
+from app.database import build_engine, get_db
 from app import main
 from app import security
 from app.config import settings
 from app.models import Notification, Reminder, ReminderOccurrence
 from app.reminder_worker import process_due_occurrences
+
+
+@pytest.mark.parametrize(
+    ("database_url", "expected_driver"),
+    [
+        ("postgres://user:password@localhost/db", "postgresql+psycopg"),
+        ("postgresql://user:password@localhost/db", "postgresql+psycopg"),
+        ("postgresql+psycopg://user:password@localhost/db", "postgresql+psycopg"),
+        ("sqlite:///:memory:", "sqlite"),
+    ],
+)
+def test_build_engine_supports_postgres_connection_schemes(
+    database_url: str,
+    expected_driver: str,
+):
+    test_engine = build_engine(database_url)
+    try:
+        assert test_engine.url.drivername == expected_driver
+    finally:
+        test_engine.dispose()
 
 
 @pytest.fixture
