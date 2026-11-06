@@ -19,6 +19,24 @@ uvicorn app.main:app --reload
 
 The API and interactive docs are available at [http://localhost:8000](http://localhost:8000) and [http://localhost:8000/docs](http://localhost:8000/docs). By default, the API creates `imara-care.db` in the current directory and seeds the configured facility and its departments.
 
+## Deploy to Vercel
+
+Import `Melissa9mpenzi/imara-care-api` as a new Vercel project with the repository root as the Root Directory. Vercel detects the FastAPI application from `index.py` and installs dependencies from `requirements.txt`.
+
+Configure these Production environment variables before using the deployment:
+
+```text
+DATABASE_URL=<PostgreSQL connection string for the clinical database>
+ENVIRONMENT=production
+FRONTEND_ORIGIN=https://imara-care.vercel.app
+AUTH_ISSUER=https://imara-care.vercel.app
+AUTH_JWKS_URL=https://imara-care.vercel.app/api/auth/jwks
+FACILITY_NAME=Imara Care Clinic
+FACILITY_CODE=IM
+```
+
+Use a persistent hosted PostgreSQL database for `DATABASE_URL`; do not rely on the function's local SQLite file, which is not persistent. The service creates its clinical tables and initial facility/departments on startup. Keep the existing authentication tables in the `auth` schema intact when sharing the frontend's database. Once deployed, set the frontend project's `NEXT_PUBLIC_API_URL` to the backend deployment URL followed by `/api/v1` and redeploy the frontend. The public `/api/v1/health` endpoint can be used to verify service availability.
+
 The following connection example is for the project's Docker database; for a standalone PostgreSQL Server, follow the setup below:
 
 ```text
