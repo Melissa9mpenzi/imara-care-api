@@ -2,7 +2,7 @@ from functools import lru_cache
 from urllib.error import URLError
 
 import jwt
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from jwt import PyJWKClient, PyJWKClientError
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -16,6 +16,7 @@ MFA_REQUIRED_ROLES = {
     "medical_director",
     "clinician",
     "pharmacist",
+    "department_head",
 }
 
 
@@ -88,5 +89,51 @@ class StaffAuthenticationMiddleware(BaseHTTPMiddleware):
         request.state.staff_user = {
             "id": claims["sub"],
             "role": staff_role,
+            "department_code": claims.get("departmentCode"),
         }
+        if staff_role == "department_head":
+            module_paths = {
+                "PHARM": "/api/v1/pharmacy",
+                "LAB": "/api/v1/laboratory",
+                "BILL": "/api/v1/billing",
+                "THR": "/api/v1/theatre",
+            }
+            module_path = module_paths.get(claims.get("departmentCode"))
+            path = request.url.path
+            is_assigned_module = module_path is not None and (
+                path == module_path or path.startswith(f"{module_path}/")
+            )
+            if not is_assigned_module and path != "/api/v1/departments/patients":
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Department heads can only access their assigned department."},
+                )
         return await call_next(request)
+
+
+def require_department_module(
+    request: Request,
+    department_code: str,
+    roles: set[str],
+    *,
+    allow_clinical: bool = False,
+) -> dict:
+    staff = getattr(request.state, "staff_user", {})
+    role = staff.get("role", "staff")
+    assigned_department = staff.get("department_code")
+
+    if role in {"admin", "facility_admin", "medical_director"}:
+        return staff
+    if role == "department_head":
+        if assigned_department == department_code:
+            return staff
+    elif role in roles:
+        if assigned_department == department_code:
+            return staff
+    elif allow_clinical and role == "clinician":
+        return staff
+
+    raise HTTPException(
+        status_code=403,
+        detail="This account is not authorized for the assigned department.",
+    )

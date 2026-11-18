@@ -1,8 +1,10 @@
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from uuid import uuid4
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
@@ -10,6 +12,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -279,3 +282,154 @@ class Notification(Base):
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     reminder_occurrence: Mapped[ReminderOccurrence | None] = relationship()
+
+
+class MedicationStockItem(Base):
+    __tablename__ = "medication_stock_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "facility_id", "name", "strength", "form",
+            name="uq_medication_stock_facility_product",
+        ),
+        CheckConstraint("quantity_on_hand >= 0", name="ck_medication_stock_nonnegative"),
+        CheckConstraint("reorder_level >= 0", name="ck_medication_stock_reorder_nonnegative"),
+        CheckConstraint("unit_price >= 0", name="ck_medication_stock_price_nonnegative"),
+        Index("ix_medication_stock_facility_active", "facility_id", "active", "name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    strength: Mapped[str] = mapped_column(String(80), nullable=False)
+    form: Mapped[str] = mapped_column(String(80), nullable=False)
+    unit: Mapped[str] = mapped_column(String(40), nullable=False)
+    quantity_on_hand: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    reorder_level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0.00"), nullable=False
+    )
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class MedicationStockMovement(Base):
+    __tablename__ = "medication_stock_movements"
+    __table_args__ = (Index("ix_medication_movement_facility_created", "facility_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    stock_item_id: Mapped[str] = mapped_column(
+        ForeignKey("medication_stock_items.id"), index=True
+    )
+    movement_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    reference: Mapped[str | None] = mapped_column(String(240))
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class MedicationOrder(Base):
+    __tablename__ = "medication_orders"
+    __table_args__ = (Index("ix_medication_order_facility_status", "facility_id", "status", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), index=True)
+    stock_item_id: Mapped[str] = mapped_column(
+        ForeignKey("medication_stock_items.id"), index=True
+    )
+    dosage: Mapped[str] = mapped_column(String(160), nullable=False)
+    frequency: Mapped[str] = mapped_column(String(160), nullable=False)
+    duration: Mapped[str | None] = mapped_column(String(100))
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    instructions: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="requested", nullable=False)
+    prescribed_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    dispensed_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    dispensed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    patient: Mapped[Patient] = relationship()
+    stock_item: Mapped[MedicationStockItem] = relationship()
+
+
+class LaboratoryOrder(Base):
+    __tablename__ = "laboratory_orders"
+    __table_args__ = (Index("ix_laboratory_order_facility_status", "facility_id", "status", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), index=True)
+    test_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    specimen: Mapped[str] = mapped_column(String(100), nullable=False)
+    priority: Mapped[str] = mapped_column(String(16), default="routine", nullable=False)
+    clinical_notes: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="requested", nullable=False)
+    result: Mapped[str | None] = mapped_column(Text)
+    ordered_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    resulted_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    resulted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    patient: Mapped[Patient] = relationship()
+
+
+class BillingInvoice(Base):
+    __tablename__ = "billing_invoices"
+    __table_args__ = (
+        UniqueConstraint("facility_id", "invoice_number", name="uq_billing_invoice_facility_number"),
+        CheckConstraint("total_amount > 0", name="ck_billing_invoice_positive_total"),
+        Index("ix_billing_invoice_facility_status", "facility_id", "status", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), index=True)
+    invoice_number: Mapped[str] = mapped_column(String(32), nullable=False)
+    description: Mapped[str] = mapped_column(String(240), nullable=False)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="unpaid", nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    patient: Mapped[Patient] = relationship()
+
+
+class BillingPayment(Base):
+    __tablename__ = "billing_payments"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_billing_payment_positive_amount"),
+        Index("ix_billing_payment_invoice_paid", "invoice_id", "paid_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    invoice_id: Mapped[str] = mapped_column(ForeignKey("billing_invoices.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    method: Mapped[str] = mapped_column(String(24), nullable=False)
+    reference: Mapped[str | None] = mapped_column(String(120))
+    recorded_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class TheatreProcedure(Base):
+    __tablename__ = "theatre_procedures"
+    __table_args__ = (
+        Index("ix_theatre_procedure_facility_status_time", "facility_id", "status", "scheduled_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), index=True)
+    procedure_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lead_clinician: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="scheduled", nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    patient: Mapped[Patient] = relationship()

@@ -29,6 +29,7 @@ from app.schemas import (
 )
 from app.reminders import router as reminders_router
 from app.security import StaffAuthenticationMiddleware
+from app.department_workflows import router as department_workflows_router
 
 
 DEFAULT_DEPARTMENTS = [
@@ -124,6 +125,7 @@ app.add_middleware(
 )
 app.add_middleware(StaffAuthenticationMiddleware)
 app.include_router(reminders_router)
+app.include_router(department_workflows_router)
 
 
 @app.on_event("startup")

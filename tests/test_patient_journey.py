@@ -79,7 +79,14 @@ def test_staff_session_cannot_access_another_facility(client: TestClient, monkey
 
 @pytest.mark.parametrize(
     "staff_role",
-    ["admin", "facility_admin", "medical_director", "clinician", "pharmacist"],
+    [
+        "admin",
+        "facility_admin",
+        "medical_director",
+        "clinician",
+        "pharmacist",
+        "department_head",
+    ],
 )
 def test_roles_requiring_mfa_cannot_access_api_before_setup(
     client: TestClient,
@@ -144,6 +151,167 @@ def register_patient(client: TestClient) -> dict:
     )
     assert response.status_code == 201
     return response.json()
+
+
+def set_staff_role(
+    monkeypatch,
+    staff_role: str,
+    department_code: str | None = None,
+    *,
+    mfa: bool = True,
+) -> None:
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {
+            "sub": "test-staff",
+            "facilityId": settings.facility_code,
+            "staffRole": staff_role,
+            "departmentCode": department_code,
+            "mfa": mfa,
+        },
+    )
+
+
+def test_department_head_is_limited_to_assigned_module_and_requires_mfa(
+    client: TestClient,
+    monkeypatch,
+):
+    set_staff_role(monkeypatch, "department_head", "LAB", mfa=False)
+    assert client.get("/api/v1/laboratory/orders").status_code == 403
+
+    set_staff_role(monkeypatch, "department_head", "LAB")
+    assert client.get("/api/v1/laboratory/orders").status_code == 200
+    assert client.get("/api/v1/pharmacy/stock").status_code == 403
+    assert client.get("/api/v1/patients").status_code == 403
+    assert client.get(
+        "/api/v1/departments/patients?department_code=LAB&q=amina"
+    ).status_code == 200
+
+
+def test_pharmacy_orders_only_deduct_stock_when_successfully_dispensed(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "pharmacy", "PHARM", mfa=False)
+    stock = client.post(
+        "/api/v1/pharmacy/stock",
+        json={
+            "name": "Amoxicillin",
+            "strength": "500 mg",
+            "form": "capsule",
+            "unit": "capsule",
+            "quantity_on_hand": 10,
+            "reorder_level": 2,
+            "unit_price": "100.00",
+        },
+    )
+    assert stock.status_code == 201
+
+    set_staff_role(monkeypatch, "clinician", "OPD")
+    order = client.post(
+        "/api/v1/pharmacy/orders",
+        json={
+            "patient_id": patient["id"],
+            "stock_item_id": stock.json()["id"],
+            "dosage": "1 capsule",
+            "frequency": "3 times daily",
+            "duration": "5 days",
+            "quantity": 6,
+        },
+    )
+    assert order.status_code == 201
+
+    set_staff_role(monkeypatch, "pharmacist", "PHARM")
+    dispensed = client.post(f"/api/v1/pharmacy/orders/{order.json()['id']}/dispense")
+    assert dispensed.status_code == 200
+    assert dispensed.json()["status"] == "dispensed"
+    assert client.get("/api/v1/pharmacy/stock").json()[0]["quantity_on_hand"] == 4
+    assert client.post(f"/api/v1/pharmacy/orders/{order.json()['id']}/dispense").status_code == 409
+
+
+def test_laboratory_result_can_only_be_recorded_once_by_lab_staff(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "clinician", "OPD")
+    order = client.post(
+        "/api/v1/laboratory/orders",
+        json={
+            "patient_id": patient["id"],
+            "test_name": "Full blood count",
+            "specimen": "Blood",
+            "priority": "routine",
+        },
+    )
+    assert order.status_code == 201
+
+    set_staff_role(monkeypatch, "laboratory", "LAB", mfa=False)
+    result = client.post(
+        f"/api/v1/laboratory/orders/{order.json()['id']}/result",
+        json={"result": "Within expected range."},
+    )
+    assert result.status_code == 200
+    assert result.json()["status"] == "resulted"
+    assert client.post(
+        f"/api/v1/laboratory/orders/{order.json()['id']}/result",
+        json={"result": "Changed result."},
+    ).status_code == 409
+
+
+def test_billing_rejects_payments_exceeding_balance(client: TestClient, monkeypatch):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "cashier", "BILL", mfa=False)
+    invoice = client.post(
+        "/api/v1/billing/invoices",
+        json={
+            "patient_id": patient["id"],
+            "description": "Consultation",
+            "total_amount": "5000.00",
+        },
+    )
+    assert invoice.status_code == 201
+    invoice_id = invoice.json()["id"]
+    payment = client.post(
+        f"/api/v1/billing/invoices/{invoice_id}/payments",
+        json={"amount": "2000.00", "method": "cash"},
+    )
+    assert payment.status_code == 201
+    assert payment.json()["status"] == "partially_paid"
+    assert payment.json()["balance"] == "3000.00"
+    assert client.post(
+        f"/api/v1/billing/invoices/{invoice_id}/payments",
+        json={"amount": "3000.01", "method": "cash"},
+    ).status_code == 409
+
+
+def test_theatre_procedure_status_transitions_are_enforced(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "theatre", "THR", mfa=False)
+    procedure = client.post(
+        "/api/v1/theatre/procedures",
+        json={
+            "patient_id": patient["id"],
+            "procedure_name": "Minor procedure",
+            "scheduled_at": "2030-01-02T09:00:00+03:00",
+            "lead_clinician": "Dr. Test",
+        },
+    )
+    assert procedure.status_code == 201
+    procedure_id = procedure.json()["id"]
+    assert client.patch(
+        f"/api/v1/theatre/procedures/{procedure_id}",
+        json={"status": "in_progress"},
+    ).status_code == 200
+    assert client.patch(
+        f"/api/v1/theatre/procedures/{procedure_id}",
+        json={"status": "cancelled"},
+    ).status_code == 409
 
 
 def test_patient_profile_can_be_viewed_and_updated(client: TestClient):
