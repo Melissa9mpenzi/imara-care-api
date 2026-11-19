@@ -23,6 +23,7 @@ from app.department_schemas import (
 from app.models import (
     AuditEvent,
     BillingInvoice,
+    Department,
     BillingPayment,
     Facility,
     LaboratoryOrder,
@@ -30,7 +31,9 @@ from app.models import (
     MedicationStockItem,
     MedicationStockMovement,
     Patient,
+    QueueEntry,
     TheatreProcedure,
+    Visit,
     utc_now,
 )
 from app.security import require_department_module
@@ -94,6 +97,28 @@ def patient_summary(patient: Patient) -> dict:
     }
 
 
+def _department_patient_ids(facility_id: str, department_id: str, code: str):
+    patient_ids = select(Visit.patient_id).where(
+        Visit.facility_id == facility_id,
+    )
+    if code != "BILL":
+        patient_ids = patient_ids.where(Visit.department_id == department_id)
+    department_orders = {
+        "PHARM": MedicationOrder,
+        "LAB": LaboratoryOrder,
+        "BILL": BillingInvoice,
+        "THR": TheatreProcedure,
+    }
+    order_model = department_orders.get(code)
+    if order_model:
+        patient_ids = patient_ids.union(
+            select(order_model.patient_id).where(
+                order_model.facility_id == facility_id
+            )
+        )
+    return patient_ids
+
+
 def stock_summary(item: MedicationStockItem) -> dict:
     return {
         "id": item.id,
@@ -150,7 +175,9 @@ def laboratory_order_summary(order: LaboratoryOrder) -> dict:
 
 
 def invoice_summary(
-    invoice: BillingInvoice, paid_amount: Decimal = Decimal("0.00")
+    invoice: BillingInvoice,
+    paid_amount: Decimal = Decimal("0.00"),
+    payments: list[BillingPayment] | None = None,
 ) -> dict:
     total = invoice.total_amount
     return {
@@ -162,6 +189,17 @@ def invoice_summary(
         "paid_amount": str(paid_amount),
         "balance": str(total - paid_amount),
         "status": invoice.status,
+        "payments": [
+            {
+                "id": payment.id,
+                "amount": str(payment.amount),
+                "method": payment.method,
+                "reference": payment.reference,
+                "recorded_by": payment.recorded_by,
+                "paid_at": payment.paid_at.isoformat(),
+            }
+            for payment in (payments or [])
+        ],
         "created_by": invoice.created_by,
         "created_at": invoice.created_at.isoformat(),
     }
@@ -224,12 +262,24 @@ def search_department_patients(
         request,
         department_code,
         module_roles[department_code],
-        allow_clinical=True,
+        allow_clinical=department_code in {"PHARM", "LAB", "THR"},
     )
     facility_id = facility_id_for(db)
+    department = db.scalar(
+        select(Department).where(
+            Department.facility_id == facility_id,
+            Department.code == department_code,
+            Department.active.is_(True),
+        )
+    )
+    if department is None:
+        raise HTTPException(status_code=404, detail="Department not found.")
     query = select(Patient).where(
         Patient.facility_id == facility_id,
         Patient.status == "active",
+        Patient.id.in_(
+            _department_patient_ids(facility_id, department.id, department_code)
+        ),
     )
     search_term = q.strip()
     if search_term:
@@ -256,6 +306,75 @@ def search_department_patients(
             "phone": patient.phone,
         }
         for patient in patients
+    ]
+
+
+@router.get("/departments/queues")
+def list_department_queue(
+    request: Request,
+    department_code: str,
+    status_filter: str = Query(
+        default="all",
+        alias="status",
+        pattern="^(all|waiting|in_service|completed|cancelled)$",
+    ),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    module_roles = {
+        "PHARM": {"pharmacy", "pharmacist"},
+        "LAB": {"laboratory"},
+        "BILL": {"billing", "cashier"},
+        "THR": {"theatre"},
+    }
+    if department_code not in module_roles:
+        raise HTTPException(status_code=403, detail="This department has no active workspace.")
+    staff_for(
+        request,
+        department_code,
+        module_roles[department_code],
+        allow_clinical=department_code in {"PHARM", "LAB", "THR"},
+    )
+    facility_id = facility_id_for(db)
+    department = db.scalar(
+        select(Department).where(
+            Department.facility_id == facility_id,
+            Department.code == department_code,
+            Department.active.is_(True),
+        )
+    )
+    if department is None:
+        raise HTTPException(status_code=404, detail="Department not found.")
+
+    query = (
+        select(QueueEntry)
+        .options(
+            joinedload(QueueEntry.visit).joinedload(Visit.patient),
+            joinedload(QueueEntry.visit).joinedload(Visit.department),
+            joinedload(QueueEntry.visit).joinedload(Visit.triage),
+        )
+        .where(
+            QueueEntry.facility_id == facility_id,
+            QueueEntry.department_id == department.id,
+        )
+    )
+    if status_filter != "all":
+        query = query.where(QueueEntry.status == status_filter)
+    entries = db.scalars(
+        query.order_by(QueueEntry.arrived_at.desc()).limit(100)
+    ).all()
+    return [
+        {
+            "id": entry.id,
+            "queue_number": entry.queue_number,
+            "priority": entry.priority,
+            "status": entry.status,
+            "arrived_at": entry.arrived_at.isoformat(),
+            "visit_id": entry.visit_id,
+            "visit_number": entry.visit.visit_number,
+            "reason": entry.visit.reason,
+            "patient": patient_summary(entry.visit.patient),
+        }
+        for entry in entries
     ]
 
 
@@ -601,8 +720,20 @@ def list_billing_invoices(
         .group_by(BillingPayment.invoice_id)
     ).all()
     paid_by_invoice = {invoice_id: amount for invoice_id, amount in paid_rows}
+    payment_rows = db.scalars(
+        select(BillingPayment)
+        .where(BillingPayment.invoice_id.in_([invoice.id for invoice in invoices]))
+        .order_by(BillingPayment.paid_at)
+    ).all()
+    payments_by_invoice: dict[str, list[BillingPayment]] = {}
+    for payment in payment_rows:
+        payments_by_invoice.setdefault(payment.invoice_id, []).append(payment)
     return [
-        invoice_summary(invoice, paid_by_invoice.get(invoice.id, Decimal("0.00")))
+        invoice_summary(
+            invoice,
+            paid_by_invoice.get(invoice.id, Decimal("0.00")),
+            payments_by_invoice.get(invoice.id, []),
+        )
         for invoice in invoices
     ]
 
@@ -613,7 +744,7 @@ def create_billing_invoice(
     request: Request,
     db: Session = Depends(get_db),
 ) -> dict:
-    staff = staff_for(request, "BILL", {"billing", "cashier"})
+    staff = staff_for(request, "BILL", {"billing"})
     facility_id = facility_id_for(db)
     patient = require_patient(db, facility_id, payload.patient_id)
     invoice = BillingInvoice(

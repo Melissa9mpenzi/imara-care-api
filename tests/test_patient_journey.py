@@ -51,7 +51,14 @@ def client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
     monkeypatch.setattr(
         security,
         "verify_access_token",
-        lambda token: {"sub": "test-staff", "facilityId": settings.facility_code},
+        lambda token: {
+            "sub": "test-staff",
+            "name": "Test Facility Admin",
+            "email": "admin@example.org",
+            "facilityId": settings.facility_code,
+            "staffRole": "facility_admin",
+            "mfa": True,
+        },
     )
     main.app.dependency_overrides[get_db] = override_get_db
     with TestClient(main.app) as test_client:
@@ -84,6 +91,7 @@ def test_staff_session_cannot_access_another_facility(client: TestClient, monkey
         "facility_admin",
         "medical_director",
         "clinician",
+        "nurse",
         "pharmacist",
         "department_head",
     ],
@@ -153,6 +161,36 @@ def register_patient(client: TestClient) -> dict:
     return response.json()
 
 
+def test_reception_can_register_but_only_records_can_edit_or_archive(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "reception", mfa=False)
+    assert client.get("/api/v1/patients").status_code == 200
+    assert client.patch(
+        f"/api/v1/patients/{patient['id']}",
+        json={"phone": "+256700100201"},
+    ).status_code == 403
+    assert client.delete(f"/api/v1/patients/{patient['id']}").status_code == 403
+    assert client.post(
+        "/api/v1/patients",
+        json={
+            "first_name": "Reception",
+            "last_name": "Registration",
+            "sex": "female",
+            "date_of_birth": "1994-05-21",
+            "usual_payment_method": "cash",
+        },
+    ).status_code == 201
+
+    set_staff_role(monkeypatch, "records", mfa=False)
+    assert client.patch(
+        f"/api/v1/patients/{patient['id']}",
+        json={"phone": "+256700100202"},
+    ).status_code == 200
+
+
 def set_staff_role(
     monkeypatch,
     staff_role: str,
@@ -186,6 +224,142 @@ def test_department_head_is_limited_to_assigned_module_and_requires_mfa(
     assert client.get("/api/v1/patients").status_code == 403
     assert client.get(
         "/api/v1/departments/patients?department_code=LAB&q=amina"
+    ).status_code == 200
+    assert client.get(
+        "/api/v1/departments/patients?department_code=PHARM&q=amina"
+    ).status_code == 403
+
+
+def test_department_head_only_sees_patients_and_queue_in_assigned_department(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    facility = client.get("/api/v1/facility").json()
+    lab = next(item for item in facility["departments"] if item["code"] == "LAB")
+    opd = next(item for item in facility["departments"] if item["code"] == "OPD")
+    checked_in = client.post(
+        "/api/v1/visits/checkin",
+        json={
+            "patient_id": patient["id"],
+            "department_id": lab["id"],
+            "reason": "Synthetic lab test",
+        },
+    )
+    assert checked_in.status_code == 201
+    other_patient_response = client.post(
+        "/api/v1/patients",
+        json={
+            "first_name": "Daniel",
+            "last_name": "Okello",
+            "sex": "male",
+            "date_of_birth": "1986-03-14",
+            "phone": "+256700100203",
+            "usual_payment_method": "cash",
+        },
+    )
+    assert other_patient_response.status_code == 201
+    other_patient = other_patient_response.json()
+    client.post(
+        "/api/v1/visits/checkin",
+        json={
+            "patient_id": other_patient["id"],
+            "department_id": opd["id"],
+            "reason": "General consultation",
+        },
+    )
+
+    set_staff_role(monkeypatch, "department_head", "LAB")
+    department_patients = client.get(
+        "/api/v1/departments/patients?department_code=LAB&limit=50"
+    )
+    assert department_patients.status_code == 200
+    assert [item["id"] for item in department_patients.json()] == [patient["id"]]
+
+    department_queue = client.get(
+        "/api/v1/departments/queues?department_code=LAB&status=all"
+    )
+    assert department_queue.status_code == 200
+    assert len(department_queue.json()) == 1
+    assert department_queue.json()[0]["patient"]["id"] == patient["id"]
+    assert client.get(
+        "/api/v1/departments/queues?department_code=OPD&status=all"
+    ).status_code == 403
+    assert client.get("/api/v1/queues?status=all").status_code == 403
+
+
+def test_specialist_roles_cannot_access_general_patients_or_other_departments(
+    client: TestClient,
+    monkeypatch,
+):
+    set_staff_role(monkeypatch, "pharmacist", "PHARM")
+    assert client.get("/api/v1/pharmacy/stock").status_code == 200
+    assert client.get("/api/v1/patients").status_code == 403
+    assert client.get("/api/v1/billing/invoices").status_code == 403
+    assert client.get(
+        "/api/v1/departments/patients?department_code=LAB"
+    ).status_code == 403
+
+
+def test_nurse_access_is_scoped_to_assigned_department_queue(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    facility = client.get("/api/v1/facility").json()
+    departments = {item["code"]: item for item in facility["departments"]}
+    lab_visit = client.post(
+        "/api/v1/visits/checkin",
+        json={
+            "patient_id": patient["id"],
+            "department_id": departments["LAB"]["id"],
+            "reason": "Synthetic lab queue test",
+        },
+    )
+    opd_visit = client.post(
+        "/api/v1/visits/checkin",
+        json={
+            "patient_id": patient["id"],
+            "department_id": departments["OPD"]["id"],
+            "reason": "Synthetic outpatient queue test",
+        },
+    )
+    assert lab_visit.status_code == opd_visit.status_code == 201
+
+    set_staff_role(monkeypatch, "nurse", "LAB")
+    scoped_facility = client.get("/api/v1/facility")
+    assert [item["code"] for item in scoped_facility.json()["departments"]] == ["LAB"]
+    assert client.get("/api/v1/dashboard").status_code == 403
+    assert client.get("/api/v1/patients").status_code == 403
+    assert client.get("/api/v1/appointments").status_code == 403
+    assert client.post(
+        "/api/v1/visits/checkin",
+        json={
+            "patient_id": patient["id"],
+            "department_id": departments["LAB"]["id"],
+            "reason": "Nurse cannot check in",
+        },
+    ).status_code == 403
+
+    own_queue = client.get(
+        f"/api/v1/queues?status=all&department_id={departments['LAB']['id']}"
+    )
+    assert own_queue.status_code == 200
+    assert len(own_queue.json()) == 1
+    assert own_queue.json()[0]["id"] == lab_visit.json()["id"]
+    assert client.get(
+        f"/api/v1/queues?status=all&department_id={departments['OPD']['id']}"
+    ).status_code == 403
+    assert client.post(
+        f"/api/v1/triage/{opd_visit.json()['visit_id']}",
+        json={"recorded_by": "Test Nurse"},
+    ).status_code == 403
+    assert client.post(
+        f"/api/v1/triage/{lab_visit.json()['visit_id']}",
+        json={"recorded_by": "Test Nurse"},
+    ).status_code == 200
+    assert client.post(
+        f"/api/v1/queues/{lab_visit.json()['id']}/call"
     ).status_code == 200
 
 
@@ -263,7 +437,7 @@ def test_laboratory_result_can_only_be_recorded_once_by_lab_staff(
 
 def test_billing_rejects_payments_exceeding_balance(client: TestClient, monkeypatch):
     patient = register_patient(client)
-    set_staff_role(monkeypatch, "cashier", "BILL", mfa=False)
+    set_staff_role(monkeypatch, "billing", "BILL", mfa=False)
     invoice = client.post(
         "/api/v1/billing/invoices",
         json={
@@ -274,6 +448,7 @@ def test_billing_rejects_payments_exceeding_balance(client: TestClient, monkeypa
     )
     assert invoice.status_code == 201
     invoice_id = invoice.json()["id"]
+    set_staff_role(monkeypatch, "cashier", "BILL", mfa=False)
     payment = client.post(
         f"/api/v1/billing/invoices/{invoice_id}/payments",
         json={"amount": "2000.00", "method": "cash"},
@@ -580,6 +755,96 @@ def test_reminders_are_private_and_reject_invalid_schedule(client: TestClient, m
         },
     )
     assert invalid.status_code == 422
+
+
+def test_support_requests_are_private_and_managers_can_track_them(
+    client: TestClient,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {
+            "sub": "test-staff",
+            "name": "Amina Staff",
+            "email": "amina.staff@example.org",
+            "facilityId": settings.facility_code,
+        },
+    )
+    created = client.post(
+        "/api/v1/support/requests",
+        json={
+            "category": "technical",
+            "subject": "Dashboard loading issue",
+            "message": "The dashboard did not load after signing in.",
+        },
+    )
+    assert created.status_code == 201
+    ticket = created.json()
+    assert ticket["ticket_number"].startswith("SUP-")
+    assert ticket["status"] == "open"
+
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {
+            "sub": "another-staff",
+            "name": "Another Staff",
+            "email": "another.staff@example.org",
+            "facilityId": settings.facility_code,
+            "staffRole": "reception",
+        },
+    )
+    assert client.get("/api/v1/support/requests").json() == []
+    assert client.patch(
+        f"/api/v1/support/requests/{ticket['id']}",
+        json={"status": "resolved"},
+    ).status_code == 403
+
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {
+            "sub": "facility-manager",
+            "name": "Facility Manager",
+            "email": "manager@example.org",
+            "facilityId": settings.facility_code,
+            "staffRole": "facility_admin",
+            "mfa": True,
+        },
+    )
+    manager_list = client.get("/api/v1/support/requests")
+    assert manager_list.status_code == 200
+    assert manager_list.json()[0]["id"] == ticket["id"]
+
+    updated = client.patch(
+        f"/api/v1/support/requests/{ticket['id']}",
+        json={"status": "in_progress"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["status"] == "in_progress"
+
+
+def test_support_request_rejects_empty_and_oversized_content(client: TestClient):
+    empty = client.post(
+        "/api/v1/support/requests",
+        json={
+            "category": "technical",
+            "subject": "  ",
+            "message": "          ",
+        },
+    )
+    assert empty.status_code == 422
+
+    oversized = client.post(
+        "/api/v1/support/requests",
+        json={
+            "category": "technical",
+            "subject": "Long message",
+            "message": "x" * 2001,
+        },
+    )
+    assert oversized.status_code == 422
 
 
 def test_snoozing_reminder_only_schedules_the_snooze_and_repeating_reminders_advance(client: TestClient):

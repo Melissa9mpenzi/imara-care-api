@@ -1,4 +1,5 @@
 from functools import lru_cache
+import re
 from urllib.error import URLError
 
 import jwt
@@ -15,9 +16,100 @@ MFA_REQUIRED_ROLES = {
     "facility_admin",
     "medical_director",
     "clinician",
+    "nurse",
     "pharmacist",
     "department_head",
 }
+STAFF_ADMIN_ROLES = {"admin", "facility_admin", "medical_director"}
+MODULE_PATHS = {
+    "PHARM": "/api/v1/pharmacy",
+    "LAB": "/api/v1/laboratory",
+    "BILL": "/api/v1/billing",
+    "THR": "/api/v1/theatre",
+}
+SPECIALIST_DEPARTMENTS = {
+    "pharmacist": "PHARM",
+    "pharmacy": "PHARM",
+    "laboratory": "LAB",
+    "cashier": "BILL",
+    "billing": "BILL",
+    "theatre": "THR",
+}
+
+
+def role_can_access_api(method: str, path: str, staff: dict) -> bool:
+    role = staff["role"]
+    if role in STAFF_ADMIN_ROLES:
+        return True
+
+    if path.startswith(("/api/v1/reminders", "/api/v1/notifications", "/api/v1/support")):
+        return True
+
+    module_code = (
+        staff.get("department_code")
+        if role == "department_head"
+        else SPECIALIST_DEPARTMENTS.get(role)
+    )
+    module_path = MODULE_PATHS.get(module_code)
+    if module_path and (path == module_path or path.startswith(f"{module_path}/")):
+        return True
+
+    if path in {"/api/v1/departments/patients", "/api/v1/departments/queues"}:
+        return role in {
+            "department_head",
+            "pharmacist",
+            "pharmacy",
+            "laboratory",
+            "cashier",
+            "billing",
+            "theatre",
+            "clinician",
+        }
+
+    if role == "clinician" and path in {
+        "/api/v1/pharmacy/orders",
+        "/api/v1/laboratory/orders",
+    }:
+        return method in {"GET", "POST"}
+
+    if role == "department_head" or role in SPECIALIST_DEPARTMENTS:
+        return False
+
+    if path == "/api/v1/health":
+        return True
+    if path == "/api/v1/facility":
+        return role in {"reception", "nurse", "clinician"}
+    if path == "/api/v1/dashboard":
+        return role in {"reception", "clinician"}
+
+    patient_collection = path == "/api/v1/patients"
+    patient_record = re.fullmatch(r"/api/v1/patients/[^/]+", path) is not None
+    if patient_collection or patient_record:
+        if method == "GET":
+            return role in {"reception", "records", "clinician"}
+        if method == "POST":
+            return role in {"reception", "records"} and patient_collection
+        if method in {"PATCH", "DELETE"}:
+            return role == "records" and patient_record
+        return False
+
+    if path == "/api/v1/appointments":
+        return role in {"reception", "clinician"} and method == "GET"
+    if re.fullmatch(r"/api/v1/appointments/[^/]+", path):
+        return role == "reception" and method == "PATCH"
+    if path == "/api/v1/visits/checkin":
+        return role == "reception" and method == "POST"
+    if path == "/api/v1/queues":
+        return role in {"reception", "nurse", "clinician"} and method == "GET"
+    if re.fullmatch(r"/api/v1/queues/[^/]+/call", path):
+        return role in {"nurse", "clinician"} and method == "POST"
+    if path == "/api/v1/queues/call-next":
+        return role in {"nurse", "clinician"} and method == "POST"
+    if re.fullmatch(r"/api/v1/triage/[^/]+", path):
+        return role in {"nurse", "clinician"} and method == "POST"
+    if path == "/api/v1/audit":
+        return False
+    return False
 
 
 @lru_cache(maxsize=1)
@@ -88,26 +180,20 @@ class StaffAuthenticationMiddleware(BaseHTTPMiddleware):
 
         request.state.staff_user = {
             "id": claims["sub"],
+            "name": claims.get("name"),
+            "email": claims.get("email"),
             "role": staff_role,
             "department_code": claims.get("departmentCode"),
         }
-        if staff_role == "department_head":
-            module_paths = {
-                "PHARM": "/api/v1/pharmacy",
-                "LAB": "/api/v1/laboratory",
-                "BILL": "/api/v1/billing",
-                "THR": "/api/v1/theatre",
-            }
-            module_path = module_paths.get(claims.get("departmentCode"))
-            path = request.url.path
-            is_assigned_module = module_path is not None and (
-                path == module_path or path.startswith(f"{module_path}/")
+        if not role_can_access_api(
+            request.method,
+            request.url.path,
+            request.state.staff_user,
+        ):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "This account is not authorized to access this resource."},
             )
-            if not is_assigned_module and path != "/api/v1/departments/patients":
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": "Department heads can only access their assigned department."},
-                )
         return await call_next(request)
 
 

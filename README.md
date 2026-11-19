@@ -65,6 +65,10 @@ The API rejects clinical data access for platform administrators, facility admin
 
 Staff can create private reminders from the dashboard. Reminders support one-time, daily, weekday, weekly, monthly, and every-N-days schedules, optional early alerts, and links to supported records. The API provides per-user reminder and notification lists and read/complete/cancel/snooze actions. Notification email, SMS, and browser-push delivery are not enabled.
 
+## Help and support requests
+
+Authenticated staff can submit technical/account support requests through `POST /api/v1/support/requests` and view their own requests through `GET /api/v1/support/requests`. Facility administrators can view facility requests and update their status through `PATCH /api/v1/support/requests/{request_id}`. Requests are facility-scoped and status changes are audited. Do not include patient identifiers or clinical information in support messages. The support form also links to `melissampeenzi@gmail.com`; in-app requests are not automatically emailed.
+
 Run the reminder scheduler in a separate terminal alongside the API:
 
 ```powershell
@@ -74,6 +78,16 @@ python -m app.reminder_worker
 ```
 
 The worker checks due reminder occurrences once per minute, stores the notification and occurrence update together, and uses database row locking where supported so multiple PostgreSQL workers do not claim the same occurrence. With SQLite, run a single worker process. Notifications are polled by the web app; live event streaming, notification preferences, quiet hours, escalation, and delivery channels are not implemented yet.
+
+## Synthetic demo data
+
+For local workflow testing only, configure `ENVIRONMENT=development` and a local SQLite `DATABASE_URL`, then run:
+
+```powershell
+python -m scripts.seed_demo_data --confirm-demo-data
+```
+
+The script refuses production/test environments without SQLite and creates clearly labelled synthetic patient, queue, appointment, pharmacy, laboratory, billing, and theatre records. It is idempotent for its own seed records. Do not run it against a shared or production database, and do not enter real patient information in the demo environment.
 
 ## Tests
 
@@ -91,8 +105,9 @@ python -m pytest -q
 - `POST /api/v1/triage/{visit_id}`
 - `GET|POST /api/v1/reminders`, `PATCH /api/v1/reminders/{reminder_id}`
 - `GET /api/v1/notifications`, `POST /api/v1/notifications/read`, `POST /api/v1/notifications/{notification_id}/snooze`
+- `GET|POST /api/v1/support/requests`, `PATCH /api/v1/support/requests/{request_id}`
 - `GET /api/v1/audit`
 
 ## Important limitations
 
-This is an early development/demo MVP. The API requires a Better Auth bearer token scoped to the configured facility and enforces MFA enrollment for sensitive staff roles. Fine-grained role-based endpoint permissions, social sign-in, passkeys, multi-facility routing, PostgreSQL row-level tenant isolation, database migrations, and the remaining clinical, laboratory, pharmacy, theatre, and billing workflows are not implemented. Do not use real patient information or expose the development API to the internet.
+This is an early development/demo MVP. The API requires a Better Auth bearer token scoped to the configured facility and enforces MFA enrollment for sensitive staff roles. API endpoint permissions distinguish administrative, reception, records, clinical, nursing, and department roles; nurses and department heads are scoped to their assigned department. This is not a substitute for a hospital security assessment: social sign-in, passkeys, multi-facility routing, PostgreSQL row-level tenant isolation, and formal database migrations are not implemented. Billing, pharmacy, laboratory, and theatre workflows are prototypes and require clinical, operational, and regulatory validation before real patient use. Do not use real patient information or expose the development API to the internet.

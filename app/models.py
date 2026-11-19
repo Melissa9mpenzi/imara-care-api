@@ -284,6 +284,46 @@ class Notification(Base):
     reminder_occurrence: Mapped[ReminderOccurrence | None] = relationship()
 
 
+class SupportRequest(Base):
+    __tablename__ = "support_requests"
+    __table_args__ = (
+        Index(
+            "ix_support_request_facility_status_created",
+            "facility_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "ix_support_request_facility_requester_created",
+            "facility_id",
+            "requester_id",
+            "created_at",
+        ),
+        UniqueConstraint(
+            "facility_id",
+            "ticket_number",
+            name="uq_support_request_facility_ticket",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    ticket_number: Mapped[str] = mapped_column(String(32), nullable=False)
+    requester_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    requester_role: Mapped[str] = mapped_column(String(40), nullable=False)
+    requester_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    requester_email: Mapped[str] = mapped_column(String(254), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject: Mapped[str] = mapped_column(String(120), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="open", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    updated_by: Mapped[str | None] = mapped_column(String(128))
+
+
 class MedicationStockItem(Base):
     __tablename__ = "medication_stock_items"
     __table_args__ = (

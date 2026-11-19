@@ -30,6 +30,7 @@ from app.schemas import (
 from app.reminders import router as reminders_router
 from app.security import StaffAuthenticationMiddleware
 from app.department_workflows import router as department_workflows_router
+from app.support_requests import router as support_requests_router
 
 
 DEFAULT_DEPARTMENTS = [
@@ -43,6 +44,7 @@ DEFAULT_DEPARTMENTS = [
     ("Laboratory", "LAB", "laboratory", "LAB"),
     ("Pharmacy", "PHARM", "pharmacy", "PH"),
     ("Theatre", "THR", "procedure", "THR"),
+    ("Billing & insurance", "BILL", "billing", "BILL"),
 ]
 
 OPEN_VISIT_STATUSES = {
@@ -126,6 +128,7 @@ app.add_middleware(
 app.add_middleware(StaffAuthenticationMiddleware)
 app.include_router(reminders_router)
 app.include_router(department_workflows_router)
+app.include_router(support_requests_router)
 
 
 @app.on_event("startup")
@@ -225,6 +228,29 @@ def require_department(
     return department
 
 
+def require_nurse_department(
+    request: Request,
+    db: Session,
+    facility_id: str,
+    department_id: str,
+) -> None:
+    staff = request.state.staff_user
+    if staff["role"] != "nurse":
+        return
+    department = db.scalar(
+        select(Department).where(
+            Department.id == department_id,
+            Department.facility_id == facility_id,
+            Department.active.is_(True),
+        )
+    )
+    if department is None or department.code != staff.get("department_code"):
+        raise HTTPException(
+            status_code=403,
+            detail="This account can only manage its assigned department queue.",
+        )
+
+
 def call_entry(db: Session, facility_id: str, entry_id: str, staff_name: str) -> dict:
     now = datetime.now(timezone.utc)
     result = db.execute(
@@ -274,13 +300,18 @@ def health_check():
 
 
 @app.get("/api/v1/facility")
-def read_facility(db: Session = Depends(get_db)):
+def read_facility(request: Request, db: Session = Depends(get_db)):
     facility = get_facility(db)
-    departments = db.scalars(
-        select(Department)
-        .where(Department.facility_id == facility.id, Department.active.is_(True))
-        .order_by(Department.name)
-    ).all()
+    department_query = select(Department).where(
+        Department.facility_id == facility.id,
+        Department.active.is_(True),
+    )
+    staff = request.state.staff_user
+    if staff["role"] == "nurse":
+        department_query = department_query.where(
+            Department.code == staff.get("department_code")
+        )
+    departments = db.scalars(department_query.order_by(Department.name)).all()
     return {
         "id": facility.id,
         "name": facility.name,
@@ -825,11 +856,33 @@ def check_in(payload: CheckInCreate, db: Session = Depends(get_db)):
 
 @app.get("/api/v1/queues")
 def list_queues(
+    request: Request,
     department_id: str | None = None,
     status_filter: str = Query(default="waiting", alias="status"),
     db: Session = Depends(get_db),
 ):
     facility = get_facility(db)
+    staff = request.state.staff_user
+    if staff["role"] == "nurse":
+        department_code = staff.get("department_code")
+        department = db.scalar(
+            select(Department).where(
+                Department.facility_id == facility.id,
+                Department.code == department_code,
+                Department.active.is_(True),
+            )
+        )
+        if department is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Assign this account to an active department before opening its queue.",
+            )
+        if department_id and department_id != department.id:
+            raise HTTPException(
+                status_code=403,
+                detail="This account can only access its assigned department queue.",
+            )
+        department_id = department.id
     query = (
         select(QueueEntry)
         .options(
@@ -859,29 +912,33 @@ def list_queues(
 @app.post("/api/v1/queues/{entry_id}/call")
 def call_queue_entry(
     entry_id: str,
+    request: Request,
     staff_name: str = Query(default="Triage Nurse", max_length=120),
     db: Session = Depends(get_db),
 ):
     facility = get_facility(db)
-    exists = db.scalar(
-        select(QueueEntry.id).where(
+    entry = db.scalar(
+        select(QueueEntry).where(
             QueueEntry.id == entry_id,
             QueueEntry.facility_id == facility.id,
         )
     )
-    if exists is None:
+    if entry is None:
         raise HTTPException(status_code=404, detail="Queue entry not found.")
+    require_nurse_department(request, db, facility.id, entry.department_id)
     return call_entry(db, facility.id, entry_id, staff_name)
 
 
 @app.post("/api/v1/queues/call-next")
 def call_next_patient(
+    request: Request,
     department_id: str,
     staff_name: str = Query(default="Triage Nurse", max_length=120),
     db: Session = Depends(get_db),
 ):
     facility = get_facility(db)
     require_department(db, facility.id, department_id)
+    require_nurse_department(request, db, facility.id, department_id)
     priority_order = case(
         (QueueEntry.priority == "emergency", 0),
         (QueueEntry.priority == "urgent", 1),
@@ -905,7 +962,12 @@ def call_next_patient(
 
 
 @app.post("/api/v1/triage/{visit_id}")
-def record_triage(visit_id: str, payload: TriageCreate, db: Session = Depends(get_db)):
+def record_triage(
+    visit_id: str,
+    payload: TriageCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
     facility = get_facility(db)
     visit = db.scalar(
         select(Visit)
@@ -914,6 +976,7 @@ def record_triage(visit_id: str, payload: TriageCreate, db: Session = Depends(ge
     )
     if visit is None:
         raise HTTPException(status_code=404, detail="Visit not found.")
+    require_nurse_department(request, db, facility.id, visit.department_id)
     if visit.status not in OPEN_VISIT_STATUSES:
         raise HTTPException(status_code=409, detail="Triage can only be recorded for an open visit.")
     data = payload.model_dump(exclude={"recorded_by", "priority"})
