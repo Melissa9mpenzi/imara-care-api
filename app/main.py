@@ -1,8 +1,11 @@
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
 from sqlalchemy import case, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
@@ -29,6 +32,7 @@ from app.schemas import (
 )
 from app.reminders import router as reminders_router
 from app.security import StaffAuthenticationMiddleware
+from app.spreadsheet_imports import read_spreadsheet_rows
 from app.department_workflows import router as department_workflows_router
 from app.support_requests import router as support_requests_router
 
@@ -55,6 +59,43 @@ OPEN_VISIT_STATUSES = {
     "awaiting_lab",
     "awaiting_pharmacy",
     "awaiting_billing",
+}
+
+PATIENT_IMPORT_ALIASES = {
+    "first_name": "first_name",
+    "given_name": "first_name",
+    "forename": "first_name",
+    "last_name": "last_name",
+    "surname": "last_name",
+    "family_name": "last_name",
+    "other_names": "other_names",
+    "other_name": "other_names",
+    "middle_name": "other_names",
+    "sex": "sex",
+    "gender": "sex",
+    "date_of_birth": "date_of_birth",
+    "dob": "date_of_birth",
+    "estimated_age": "estimated_age",
+    "age": "estimated_age",
+    "phone": "phone",
+    "phone_number": "phone",
+    "mobile": "phone",
+    "alt_phone": "alt_phone",
+    "alternate_phone": "alt_phone",
+    "email": "email",
+    "email_address": "email",
+    "national_id": "national_id",
+    "nin": "national_id",
+    "address": "address",
+    "next_of_kin_name": "next_of_kin_name",
+    "next_of_kin": "next_of_kin_name",
+    "next_of_kin_relationship": "next_of_kin_relationship",
+    "next_of_kin_phone": "next_of_kin_phone",
+    "usual_payment_method": "usual_payment_method",
+    "payment_method": "usual_payment_method",
+    "allergies": "allergies",
+    "known_allergies": "allergies",
+    "sms_consent": "sms_consent",
 }
 
 
@@ -433,30 +474,16 @@ def create_patient(payload: PatientCreate, db: Session = Depends(get_db)):
     )
     if facility is None:
         raise HTTPException(status_code=503, detail="Facility setup is incomplete.")
-    duplicate_query = select(Patient).where(
-        Patient.facility_id == facility.id,
-        Patient.status == "active",
-    )
-    duplicate_checks = []
-    if payload.phone:
-        duplicate_checks.append(Patient.phone == payload.phone)
-    if payload.date_of_birth:
-        duplicate_checks.append(
-            (func.lower(Patient.first_name) == payload.first_name.lower())
-            & (func.lower(Patient.last_name) == payload.last_name.lower())
-            & (Patient.date_of_birth == payload.date_of_birth)
+    match = find_patient_duplicate(db, facility.id, payload)
+    if match:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "possible_duplicate",
+                "message": "A patient with the same phone number, national ID, or name and date of birth already exists.",
+                "patient": patient_summary(match),
+            },
         )
-    if duplicate_checks:
-        match = db.scalar(duplicate_query.where(or_(*duplicate_checks)).limit(1))
-        if match:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "possible_duplicate",
-                    "message": "A patient with the same phone number or name and date of birth already exists.",
-                    "patient": patient_summary(match),
-                },
-            )
 
     sequence = facility.next_patient_number
     facility.next_patient_number += 1
@@ -478,6 +505,235 @@ def create_patient(payload: PatientCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(patient)
     return patient
+
+
+def normalize_patient_import_row(row: dict[str, Any]) -> PatientCreate:
+    values = {
+        key: value.strip() if isinstance(value, str) else value
+        for key, value in row.items()
+        if key != "_row_number"
+    }
+    for field in (
+        "other_names",
+        "date_of_birth",
+        "estimated_age",
+        "phone",
+        "alt_phone",
+        "email",
+        "national_id",
+        "address",
+        "next_of_kin_name",
+        "next_of_kin_relationship",
+        "next_of_kin_phone",
+    ):
+        if values.get(field) == "":
+            values[field] = None
+
+    sex = str(values.get("sex") or "").strip().casefold()
+    values["sex"] = {
+        "f": "female",
+        "m": "male",
+        "not specified": "not_specified",
+        "not_specified": "not_specified",
+    }.get(sex, sex)
+
+    payment_method = str(values.get("usual_payment_method") or "cash").strip().casefold()
+    values["usual_payment_method"] = payment_method.replace(" ", "_")
+
+    allergies = values.get("allergies")
+    if isinstance(allergies, str):
+        values["allergies"] = [
+            item.strip()
+            for item in allergies.replace(",", ";").split(";")
+            if item.strip()
+        ]
+    elif allergies is None:
+        values["allergies"] = []
+
+    consent = values.get("sms_consent")
+    if consent is None or consent == "":
+        values["sms_consent"] = False
+    elif isinstance(consent, str):
+        values["sms_consent"] = {
+            "yes": True,
+            "y": True,
+            "1": True,
+            "true": True,
+            "no": False,
+            "n": False,
+            "0": False,
+            "false": False,
+        }.get(consent.casefold(), consent)
+
+    return PatientCreate.model_validate(values)
+
+
+def find_patient_duplicate(
+    db: Session,
+    facility_id: str,
+    payload: PatientCreate,
+    *,
+    include_inactive: bool = False,
+) -> Patient | None:
+    duplicate_checks = []
+    if payload.phone:
+        duplicate_checks.append(Patient.phone == payload.phone)
+    if payload.national_id:
+        duplicate_checks.append(
+            func.lower(Patient.national_id) == str(payload.national_id).casefold()
+        )
+    if payload.date_of_birth:
+        duplicate_checks.append(
+            (func.lower(Patient.first_name) == payload.first_name.casefold())
+            & (func.lower(Patient.last_name) == payload.last_name.casefold())
+            & (Patient.date_of_birth == payload.date_of_birth)
+        )
+    if not duplicate_checks:
+        return None
+    query = select(Patient).where(
+        Patient.facility_id == facility_id,
+        or_(*duplicate_checks),
+    )
+    if not include_inactive:
+        query = query.where(Patient.status == "active")
+    return db.scalar(query.limit(1))
+
+
+def patient_import_error(error: ValidationError) -> str:
+    return "; ".join(
+        f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
+        for item in error.errors(include_input=False)
+    )
+
+
+@app.post("/api/v1/patients/import")
+def import_patients(
+    request: Request,
+    file: UploadFile = File(...),
+    preview: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    rows = read_spreadsheet_rows(
+        file,
+        aliases=PATIENT_IMPORT_ALIASES,
+        required_columns={"first_name", "last_name", "sex"},
+    )
+    facility_query = select(Facility).where(Facility.code == settings.facility_code)
+    if not preview:
+        facility_query = facility_query.with_for_update()
+    facility = db.scalar(facility_query)
+    if facility is None:
+        raise HTTPException(status_code=503, detail="Facility setup is incomplete.")
+
+    seen_phones: set[str] = set()
+    seen_national_ids: set[str] = set()
+    seen_name_dates: set[tuple[str, str, date]] = set()
+    results: list[dict[str, Any]] = []
+    ready_rows: list[tuple[int, PatientCreate]] = []
+
+    for row_number, raw_row in rows:
+        try:
+            payload = normalize_patient_import_row(raw_row)
+        except ValidationError as error:
+            results.append({
+                "row": row_number,
+                "display": "Patient row",
+                "status": "invalid",
+                "message": patient_import_error(error),
+            })
+            continue
+
+        display = " ".join(
+            part for part in (payload.first_name, payload.other_names, payload.last_name) if part
+        )
+        phone = payload.phone.casefold() if payload.phone else None
+        national_id = str(payload.national_id).casefold() if payload.national_id else None
+        name_date = (
+            payload.first_name.casefold(),
+            payload.last_name.casefold(),
+            payload.date_of_birth,
+        ) if payload.date_of_birth else None
+        duplicate_in_file = (
+            (phone is not None and phone in seen_phones)
+            or (national_id is not None and national_id in seen_national_ids)
+            or (name_date is not None and name_date in seen_name_dates)
+        )
+        if duplicate_in_file or find_patient_duplicate(
+            db,
+            facility.id,
+            payload,
+            include_inactive=True,
+        ):
+            results.append({
+                "row": row_number,
+                "display": display,
+                "status": "duplicate",
+                "message": "Matches an existing patient or another row in this file; no record was changed.",
+            })
+            continue
+
+        if phone:
+            seen_phones.add(phone)
+        if national_id:
+            seen_national_ids.add(national_id)
+        if name_date:
+            seen_name_dates.add(name_date)
+        ready_rows.append((row_number, payload))
+        results.append({
+            "row": row_number,
+            "display": display,
+            "status": "ready" if preview else "imported",
+            "message": "Ready to create." if preview else "Patient created.",
+        })
+
+    if preview:
+        return {
+            "preview": True,
+            "total_rows": len(rows),
+            "created": 0,
+            "ready": len(ready_rows),
+            "duplicates": sum(row["status"] == "duplicate" for row in results),
+            "invalid": sum(row["status"] == "invalid" for row in results),
+            "rows": results,
+        }
+
+    actor = request.state.staff_user.get("name") or request.state.staff_user["id"]
+    try:
+        for _, payload in ready_rows:
+            patient = Patient(
+                facility_id=facility.id,
+                patient_number=f"{facility.code}-{date.today().year}-{facility.next_patient_number:06d}",
+                **payload.model_dump(),
+            )
+            facility.next_patient_number += 1
+            db.add(patient)
+            db.flush()
+            audit(
+                db,
+                facility.id,
+                "patient.created",
+                "patient",
+                patient.id,
+                {"patient_number": patient.patient_number, "source": "spreadsheet_import"},
+                actor=actor,
+            )
+        db.commit()
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="The patient import could not be committed. No rows were saved; preview the file and try again.",
+        ) from error
+
+    return {
+        "preview": False,
+        "total_rows": len(rows),
+        "created": len(ready_rows),
+        "ready": 0,
+        "duplicates": sum(row["status"] == "duplicate" for row in results),
+        "invalid": sum(row["status"] == "invalid" for row in results),
+        "rows": results,
+    }
 
 
 @app.get("/api/v1/patients/{patient_id}")

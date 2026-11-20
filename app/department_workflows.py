@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from pydantic import ValidationError
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
@@ -37,8 +38,30 @@ from app.models import (
     utc_now,
 )
 from app.security import require_department_module
+from app.spreadsheet_imports import read_spreadsheet_rows
 
 router = APIRouter(prefix="/api/v1", tags=["department workflows"])
+
+STOCK_IMPORT_ALIASES = {
+    "name": "name",
+    "medicine": "name",
+    "medicine_name": "name",
+    "drug_name": "name",
+    "strength": "strength",
+    "form": "form",
+    "formulation": "form",
+    "unit": "unit",
+    "stock_unit": "unit",
+    "unit_of_measure": "unit",
+    "quantity_on_hand": "quantity_on_hand",
+    "quantity": "quantity_on_hand",
+    "stock_quantity": "quantity_on_hand",
+    "opening_quantity": "quantity_on_hand",
+    "reorder_level": "reorder_level",
+    "reorder_at": "reorder_level",
+    "unit_price": "unit_price",
+    "price": "unit_price",
+}
 
 
 def facility_id_for(db: Session) -> str:
@@ -422,6 +445,295 @@ def create_pharmacy_stock(
     db.commit()
     db.refresh(item)
     return stock_summary(item)
+
+
+def normalize_stock_import_row(row: dict) -> StockItemCreate:
+    values = {
+        key: value.strip() if isinstance(value, str) else value
+        for key, value in row.items()
+        if key != "_row_number"
+    }
+    return StockItemCreate.model_validate(values)
+
+
+def stock_import_error(error: ValidationError) -> str:
+    return "; ".join(
+        f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
+        for item in error.errors(include_input=False)
+    )
+
+
+@router.post("/pharmacy/stock/import")
+def import_pharmacy_stock(
+    request: Request,
+    file: UploadFile = File(...),
+    reference: str = Form(..., min_length=1, max_length=200),
+    preview: bool = Query(default=False),
+    confirm_restock_matches: bool = Form(default=False),
+    db: Session = Depends(get_db),
+) -> dict:
+    staff = staff_for(request, "PHARM", {"pharmacy", "pharmacist"})
+    reference = reference.strip()
+    if not reference:
+        raise HTTPException(status_code=422, detail="A stock receipt reference is required.")
+    rows = read_spreadsheet_rows(
+        file,
+        aliases=STOCK_IMPORT_ALIASES,
+        required_columns={"name", "strength", "form", "unit", "quantity_on_hand"},
+    )
+    receipt_reference = f"Bulk stock import: {reference}"
+    facility_query = select(Facility).where(Facility.code == settings.facility_code)
+    if not preview:
+        facility_query = facility_query.with_for_update()
+    facility = db.scalar(facility_query)
+    if facility is None:
+        raise HTTPException(status_code=503, detail="Facility setup is incomplete.")
+
+    previous_receipt = db.scalar(
+        select(MedicationStockMovement.id)
+        .where(
+            MedicationStockMovement.facility_id == facility.id,
+            func.lower(MedicationStockMovement.reference)
+            == receipt_reference.casefold(),
+        )
+        .limit(1)
+    )
+    if previous_receipt is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="This stock receipt reference has already been used. Use a new reference to prevent double-counting.",
+        )
+
+    existing_items = db.scalars(
+        select(MedicationStockItem).where(
+            MedicationStockItem.facility_id == facility.id,
+        )
+    ).all()
+    items_by_key: dict[tuple[str, str, str], list[MedicationStockItem]] = {}
+    for item in existing_items:
+        key = (item.name.strip().casefold(), item.strength.strip().casefold(), item.form.strip().casefold())
+        items_by_key.setdefault(key, []).append(item)
+
+    seen_file_keys: set[tuple[str, str, str]] = set()
+    parsed_rows: list[tuple[int, StockItemCreate, str, MedicationStockItem | None]] = []
+    results: list[dict] = []
+    restock_count = 0
+    new_count = 0
+
+    for row_number, raw_row in rows:
+        try:
+            payload = normalize_stock_import_row(raw_row)
+        except ValidationError as error:
+            results.append({
+                "row": row_number,
+                "display": "Medicine row",
+                "status": "invalid",
+                "message": stock_import_error(error),
+            })
+            continue
+
+        display = f"{payload.name} {payload.strength} ({payload.form})"
+        if payload.quantity_on_hand < 1:
+            results.append({
+                "row": row_number,
+                "display": display,
+                "status": "invalid",
+                "message": "Quantity must be greater than zero for a stock import.",
+            })
+            continue
+
+        key = (payload.name.casefold(), payload.strength.casefold(), payload.form.casefold())
+        if key in seen_file_keys:
+            results.append({
+                "row": row_number,
+                "display": display,
+                "status": "duplicate",
+                "message": "This medicine appears more than once in the file; only the first row is considered.",
+            })
+            continue
+        seen_file_keys.add(key)
+
+        matches = items_by_key.get(key, [])
+        if len(matches) > 1:
+            results.append({
+                "row": row_number,
+                "display": display,
+                "status": "invalid",
+                "message": "More than one stock item matches this medicine; resolve the existing inventory first.",
+            })
+            continue
+        existing = matches[0] if matches else None
+        if existing is not None and not existing.active:
+            results.append({
+                "row": row_number,
+                "display": display,
+                "status": "duplicate",
+                "message": "An inactive stock item already matches this medicine; it was not changed.",
+            })
+            continue
+        if existing is not None and existing.unit.strip().casefold() != payload.unit.casefold():
+            results.append({
+                "row": row_number,
+                "display": display,
+                "status": "invalid",
+                "message": "The stock unit differs from the existing item; no stock was changed.",
+            })
+            continue
+
+        if existing is not None:
+            restock_count += 1
+            status_label = "restock"
+            message = (
+                f"Will add {payload.quantity_on_hand} {payload.unit} to existing stock; "
+                "price and reorder level will not change."
+            )
+        else:
+            new_count += 1
+            status_label = "new"
+            message = "A new stock item will be created."
+        parsed_rows.append((row_number, payload, status_label, existing))
+        results.append({
+            "row": row_number,
+            "display": display,
+            "status": status_label,
+            "message": message,
+        })
+
+    if preview:
+        return {
+            "preview": True,
+            "total_rows": len(rows),
+            "created": 0,
+            "restocked": 0,
+            "new": new_count,
+            "restock": restock_count,
+            "duplicates": sum(row["status"] == "duplicate" for row in results),
+            "invalid": sum(row["status"] == "invalid" for row in results),
+            "rows": results,
+        }
+    if restock_count and not confirm_restock_matches:
+        raise HTTPException(
+            status_code=400,
+            detail="Confirm that matching stock quantities should be added before importing.",
+        )
+
+    committed_results: list[dict] = []
+    try:
+        for row_number, payload, row_status, existing in parsed_rows:
+            if row_status == "new":
+                item = MedicationStockItem(
+                    facility_id=facility.id,
+                    name=payload.name,
+                    strength=payload.strength,
+                    form=payload.form,
+                    unit=payload.unit,
+                    quantity_on_hand=payload.quantity_on_hand,
+                    reorder_level=payload.reorder_level,
+                    unit_price=payload.unit_price,
+                )
+                db.add(item)
+                db.flush()
+                add_audit(
+                    db,
+                    facility.id,
+                    staff["id"],
+                    "pharmacy.stock_created",
+                    "medication_stock_item",
+                    item.id,
+                    {"source": "spreadsheet_import", "reference": reference},
+                )
+                status_label = "created"
+                if payload.quantity_on_hand:
+                    db.add(
+                        MedicationStockMovement(
+                            facility_id=facility.id,
+                            stock_item_id=item.id,
+                            movement_type="received",
+                            quantity=payload.quantity_on_hand,
+                            reference=receipt_reference,
+                            created_by=staff["id"],
+                        )
+                    )
+            else:
+                if existing is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A matching stock item changed during import. Preview the file again.",
+                    )
+                item = db.scalar(
+                    select(MedicationStockItem)
+                    .where(
+                        MedicationStockItem.id == existing.id,
+                        MedicationStockItem.facility_id == facility.id,
+                        MedicationStockItem.active.is_(True),
+                    )
+                    .with_for_update()
+                )
+                if item is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A matching stock item changed during import. Preview the file again.",
+                    )
+                item.quantity_on_hand += payload.quantity_on_hand
+                item.updated_at = utc_now()
+                db.add(
+                    MedicationStockMovement(
+                        facility_id=facility.id,
+                        stock_item_id=item.id,
+                        movement_type="received",
+                        quantity=payload.quantity_on_hand,
+                        reference=receipt_reference,
+                        created_by=staff["id"],
+                    )
+                )
+                add_audit(
+                    db,
+                    facility.id,
+                    staff["id"],
+                    "pharmacy.stock_received",
+                    "medication_stock_item",
+                    item.id,
+                    {
+                        "quantity": payload.quantity_on_hand,
+                        "source": "spreadsheet_import",
+                        "reference": reference,
+                    },
+                )
+                status_label = "restocked"
+            committed_results.append({
+                "row": row_number,
+                "display": f"{payload.name} {payload.strength} ({payload.form})",
+                "status": status_label,
+                "message": "Stock item imported.",
+            })
+        db.flush()
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="The stock import could not be committed. No rows were saved; preview the file and try again.",
+        ) from error
+
+    committed_by_row = {result["row"]: result for result in committed_results}
+    final_results = [
+        committed_by_row.get(result["row"], result)
+        for result in results
+    ]
+    return {
+        "preview": False,
+        "total_rows": len(rows),
+        "created": sum(result["status"] == "created" for result in committed_results),
+        "restocked": sum(result["status"] == "restocked" for result in committed_results),
+        "new": 0,
+        "restock": 0,
+        "duplicates": sum(row["status"] == "duplicate" for row in final_results),
+        "invalid": sum(row["status"] == "invalid" for row in final_results),
+        "rows": final_results,
+    }
 
 
 @router.post("/pharmacy/stock/{item_id}/receive")

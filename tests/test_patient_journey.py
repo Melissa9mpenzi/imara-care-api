@@ -1,6 +1,8 @@
 from collections.abc import Generator
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 
+from openpyxl import Workbook
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -189,6 +191,94 @@ def test_reception_can_register_but_only_records_can_edit_or_archive(
         f"/api/v1/patients/{patient['id']}",
         json={"phone": "+256700100202"},
     ).status_code == 200
+
+
+def test_patient_spreadsheet_import_previews_creates_and_skips_duplicates_and_invalid_rows(
+    client: TestClient,
+    monkeypatch,
+):
+    set_staff_role(monkeypatch, "reception", mfa=False)
+    content = (
+        "first_name,last_name,sex,date_of_birth,estimated_age,phone\n"
+        "Grace,Nakato,female,1992-03-14,,+256700123456\n"
+        "Another,Name,female,1990-01-01,,+256700123456\n"
+        "No,Age,male,,,\n"
+    ).encode()
+    upload = {"file": ("patients.csv", content, "text/csv")}
+
+    preview = client.post("/api/v1/patients/import?preview=true", files=upload)
+    assert preview.status_code == 200
+    assert preview.json()["ready"] == 1
+    assert preview.json()["duplicates"] == 1
+    assert preview.json()["invalid"] == 1
+    assert client.get("/api/v1/patients").json() == []
+
+    imported = client.post("/api/v1/patients/import", files=upload)
+    assert imported.status_code == 200
+    assert imported.json()["created"] == 1
+    assert imported.json()["duplicates"] == 1
+    assert imported.json()["invalid"] == 1
+    patients = client.get("/api/v1/patients").json()
+    assert len(patients) == 1
+    assert patients[0]["first_name"] == "Grace"
+    assert client.post("/api/v1/patients/import", files=upload).json()["created"] == 0
+
+
+def test_patient_spreadsheet_import_is_not_available_to_clinicians(
+    client: TestClient,
+    monkeypatch,
+):
+    set_staff_role(monkeypatch, "clinician")
+    response = client.post(
+        "/api/v1/patients/import?preview=true",
+        files={"file": ("patients.csv", b"first_name,last_name,sex\n", "text/csv")},
+    )
+    assert response.status_code == 403
+
+
+def test_patient_spreadsheet_import_accepts_xlsx_and_rejects_formula_cells(
+    client: TestClient,
+    monkeypatch,
+):
+    set_staff_role(monkeypatch, "records", mfa=False)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["first_name", "last_name", "sex", "date_of_birth"])
+    sheet.append(["Nora", "Kato", "female", "1993-04-02"])
+    contents = BytesIO()
+    workbook.save(contents)
+
+    response = client.post(
+        "/api/v1/patients/import?preview=true",
+        files={
+            "file": (
+                "patients.xlsx",
+                contents.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["ready"] == 1
+
+    formula_book = Workbook()
+    formula_sheet = formula_book.active
+    formula_sheet.append(["first_name", "last_name", "sex", "date_of_birth"])
+    formula_sheet.append(["=1+1", "Formula", "female", "1993-04-02"])
+    formula_contents = BytesIO()
+    formula_book.save(formula_contents)
+    formula_response = client.post(
+        "/api/v1/patients/import?preview=true",
+        files={
+            "file": (
+                "patients.xlsx",
+                formula_contents.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert formula_response.status_code == 422
+    assert "formula" in formula_response.json()["detail"].lower()
 
 
 def set_staff_role(
@@ -403,6 +493,70 @@ def test_pharmacy_orders_only_deduct_stock_when_successfully_dispensed(
     assert dispensed.json()["status"] == "dispensed"
     assert client.get("/api/v1/pharmacy/stock").json()[0]["quantity_on_hand"] == 4
     assert client.post(f"/api/v1/pharmacy/orders/{order.json()['id']}/dispense").status_code == 409
+
+
+def test_pharmacy_stock_spreadsheet_import_requires_restock_confirmation_and_reference(
+    client: TestClient,
+    monkeypatch,
+):
+    set_staff_role(monkeypatch, "pharmacist", "PHARM")
+    existing = client.post(
+        "/api/v1/pharmacy/stock",
+        json={
+            "name": "Ibuprofen",
+            "strength": "200 mg",
+            "form": "tablet",
+            "unit": "tablet",
+            "quantity_on_hand": 8,
+        },
+    )
+    assert existing.status_code == 201
+    content = (
+        "name,strength,form,unit,quantity_on_hand,reorder_level,unit_price\n"
+        "Ibuprofen,200 mg,tablet,tablet,5,3,100\n"
+        "Paracetamol,500 mg,tablet,tablet,12,4,50\n"
+        "Paracetamol,500 mg,tablet,tablet,2,4,50\n"
+        "Aspirin,75 mg,tablet,tablet,0,2,25\n"
+    ).encode()
+    upload = {"file": ("stock.csv", content, "text/csv")}
+    reference = "DELIVERY-2026-001"
+
+    preview = client.post(
+        "/api/v1/pharmacy/stock/import?preview=true",
+        data={"reference": reference},
+        files=upload,
+    )
+    assert preview.status_code == 200
+    assert preview.json()["restock"] == 1
+    assert preview.json()["new"] == 1
+    assert preview.json()["duplicates"] == 1
+    assert preview.json()["invalid"] == 1
+    assert client.get("/api/v1/pharmacy/stock").json()[0]["quantity_on_hand"] == 8
+
+    unconfirmed = client.post(
+        "/api/v1/pharmacy/stock/import",
+        data={"reference": reference},
+        files=upload,
+    )
+    assert unconfirmed.status_code == 400
+
+    imported = client.post(
+        "/api/v1/pharmacy/stock/import",
+        data={"reference": reference, "confirm_restock_matches": "true"},
+        files=upload,
+    )
+    assert imported.status_code == 200
+    assert imported.json()["created"] == 1
+    assert imported.json()["restocked"] == 1
+    assert sorted(item["quantity_on_hand"] for item in client.get(
+        "/api/v1/pharmacy/stock"
+    ).json()) == [12, 13]
+    reused_reference = client.post(
+        "/api/v1/pharmacy/stock/import?preview=true",
+        data={"reference": reference},
+        files=upload,
+    )
+    assert reused_reference.status_code == 409
 
 
 def test_laboratory_result_can_only_be_recorded_once_by_lab_staff(

@@ -67,7 +67,7 @@ Staff can create private reminders from the dashboard. Reminders support one-tim
 
 ## Help and support requests
 
-Authenticated staff can submit technical/account support requests through `POST /api/v1/support/requests` and view their own requests through `GET /api/v1/support/requests`. Facility administrators can view facility requests and update their status through `PATCH /api/v1/support/requests/{request_id}`. Requests are facility-scoped and status changes are audited. Do not include patient identifiers or clinical information in support messages. The support form also links to `melissampeenzi@gmail.com`; in-app requests are not automatically emailed.
+Authenticated staff can submit technical/account support requests through `POST /api/v1/support/requests` and view their own requests through `GET /api/v1/support/requests`. Facility administrators can view facility requests and update their status through `PATCH /api/v1/support/requests/{request_id}`. Requests are facility-scoped and status changes are audited. Do not include patient identifiers or clinical information in support messages. The support form also links to `melissampenzi@gmail.com`; in-app requests are not automatically emailed.
 
 Run the reminder scheduler in a separate terminal alongside the API:
 
@@ -99,6 +99,7 @@ python -m pytest -q
 
 - `GET /api/v1/health`, `GET /api/v1/facility`, `GET /api/v1/dashboard`
 - `GET|POST /api/v1/patients`, `GET|PATCH|DELETE /api/v1/patients/{patient_id}`
+- `POST /api/v1/patients/import` (multipart CSV/XLSX upload; use `?preview=true` to validate before creating new records)
 - `GET|POST /api/v1/appointments`, `PATCH /api/v1/appointments/{appointment_id}`
 - `POST /api/v1/visits/checkin`
 - `GET /api/v1/queues`, `POST /api/v1/queues/{entry_id}/call`, `POST /api/v1/queues/call-next`
@@ -107,6 +108,9 @@ python -m pytest -q
 - `GET /api/v1/notifications`, `POST /api/v1/notifications/read`, `POST /api/v1/notifications/{notification_id}/snooze`
 - `GET|POST /api/v1/support/requests`, `PATCH /api/v1/support/requests/{request_id}`
 - `GET /api/v1/audit`
+- `POST /api/v1/pharmacy/stock/import` (multipart CSV/XLSX upload; use `?preview=true` before confirming matched-item restocks)
+
+Spreadsheet imports accept `.csv` and `.xlsx` files up to 5 MB and 500 non-empty data rows. Patient imports create valid new records only; existing and repeated patients are reported as duplicates and are never overwritten. Pharmacy stock imports add quantities to matching items only after explicit confirmation, preserve existing prices and reorder levels, and require a unique receipt reference to prevent accidental repeat imports. Both workflows report invalid and duplicate rows without importing them. Lot and expiry tracking are not included.
 
 ## Important limitations
 

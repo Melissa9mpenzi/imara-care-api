@@ -83,12 +83,18 @@ def role_can_access_api(method: str, path: str, staff: dict) -> bool:
         return role in {"reception", "clinician"}
 
     patient_collection = path == "/api/v1/patients"
-    patient_record = re.fullmatch(r"/api/v1/patients/[^/]+", path) is not None
-    if patient_collection or patient_record:
+    patient_import = path == "/api/v1/patients/import"
+    patient_record = (
+        not patient_import
+        and re.fullmatch(r"/api/v1/patients/[^/]+", path) is not None
+    )
+    if patient_collection or patient_import or patient_record:
         if method == "GET":
-            return role in {"reception", "records", "clinician"}
+            return role in {"reception", "records", "clinician"} and patient_collection
         if method == "POST":
-            return role in {"reception", "records"} and patient_collection
+            return role in {"reception", "records"} and (
+                patient_collection or patient_import
+            )
         if method in {"PATCH", "DELETE"}:
             return role == "records" and patient_record
         return False
