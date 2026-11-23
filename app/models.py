@@ -436,6 +436,60 @@ class BillingInvoice(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     patient: Mapped[Patient] = relationship()
+    items: Mapped[list["BillingInvoiceLine"]] = relationship(
+        back_populates="invoice",
+        cascade="all, delete-orphan",
+        order_by="BillingInvoiceLine.position",
+    )
+    billing_details: Mapped["BillingInvoiceDetails | None"] = relationship(
+        back_populates="invoice",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class BillingInvoiceLine(Base):
+    __tablename__ = "billing_invoice_lines"
+    __table_args__ = (
+        UniqueConstraint("invoice_id", "position", name="uq_billing_invoice_line_position"),
+        CheckConstraint("quantity > 0", name="ck_billing_invoice_line_quantity_positive"),
+        CheckConstraint("unit_price > 0", name="ck_billing_invoice_line_price_positive"),
+        CheckConstraint("amount > 0", name="ck_billing_invoice_line_amount_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    invoice_id: Mapped[str] = mapped_column(
+        ForeignKey("billing_invoices.id", ondelete="CASCADE"),
+        index=True,
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    description: Mapped[str] = mapped_column(String(240), nullable=False)
+    unit: Mapped[str] = mapped_column(String(40), default="service", nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+
+    invoice: Mapped[BillingInvoice] = relationship(back_populates="items")
+
+
+class BillingInvoiceDetails(Base):
+    __tablename__ = "billing_invoice_details"
+
+    invoice_id: Mapped[str] = mapped_column(
+        ForeignKey("billing_invoices.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    bill_to_name: Mapped[str | None] = mapped_column(String(160))
+    bill_to_phone: Mapped[str | None] = mapped_column(String(32))
+    payer_type: Mapped[str] = mapped_column(String(24), default="self_pay", nullable=False)
+    insurer_name: Mapped[str | None] = mapped_column(String(160))
+    payer_reference: Mapped[str | None] = mapped_column(String(80))
+    service_date: Mapped[date | None] = mapped_column(Date)
+    due_date: Mapped[date | None] = mapped_column(Date)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    invoice: Mapped[BillingInvoice] = relationship(back_populates="billing_details")
 
 
 class BillingPayment(Base):

@@ -616,6 +616,93 @@ def test_billing_rejects_payments_exceeding_balance(client: TestClient, monkeypa
     ).status_code == 409
 
 
+def test_billing_itemizes_charges_and_prefills_registered_patient_contact(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "billing", "BILL", mfa=False)
+
+    patient_search = client.get(
+        "/api/v1/departments/patients?department_code=BILL&q=Amina"
+    )
+    assert patient_search.status_code == 200
+    assert patient_search.json()[0]["id"] == patient["id"]
+    assert patient_search.json()[0]["phone"] == "+256700100200"
+
+    invoice = client.post(
+        "/api/v1/billing/invoices",
+        json={
+            "patient_id": patient["id"],
+            "description": "Consultation + 1 more",
+            "items": [
+                {
+                    "description": "Consultation",
+                    "unit": "visit",
+                    "quantity": "1.15",
+                    "unit_price": "0.10",
+                },
+                {
+                    "description": "Laboratory test",
+                    "unit": "test",
+                    "quantity": "2.00",
+                    "unit_price": "100.00",
+                },
+            ],
+            "bill_to_name": "Amina Nabirye",
+            "bill_to_phone": "+256700100200",
+            "payer_type": "insurance",
+            "insurer_name": "Imara Health",
+            "payer_reference": "MEM-001",
+            "service_date": "2025-03-10",
+            "due_date": "2025-03-20",
+            "notes": "Front desk payment plan.",
+        },
+    )
+    assert invoice.status_code == 201
+    created = invoice.json()
+    assert created["total_amount"] == "200.12"
+    assert [item["amount"] for item in created["items"]] == ["0.12", "200.00"]
+    assert created["billing_details"] == {
+        "bill_to_name": "Amina Nabirye",
+        "bill_to_phone": "+256700100200",
+        "payer_type": "insurance",
+        "insurer_name": "Imara Health",
+        "payer_reference": "MEM-001",
+        "service_date": "2025-03-10",
+        "due_date": "2025-03-20",
+        "notes": "Front desk payment plan.",
+    }
+
+    listed = client.get("/api/v1/billing/invoices")
+    assert listed.status_code == 200
+    assert listed.json()[0]["patient"]["phone"] == "+256700100200"
+    assert listed.json()[0]["items"] == created["items"]
+
+
+def test_billing_itemized_invoice_rejects_a_mismatched_total(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "billing", "BILL", mfa=False)
+    response = client.post(
+        "/api/v1/billing/invoices",
+        json={
+            "patient_id": patient["id"],
+            "total_amount": "99.00",
+            "items": [
+                {
+                    "description": "Consultation",
+                    "quantity": "1",
+                    "unit_price": "100.00",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
 def test_theatre_procedure_status_transitions_are_enforced(
     client: TestClient,
     monkeypatch,

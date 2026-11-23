@@ -79,6 +79,12 @@ python -m app.reminder_worker
 
 The worker checks due reminder occurrences once per minute, stores the notification and occurrence update together, and uses database row locking where supported so multiple PostgreSQL workers do not claim the same occurrence. With SQLite, run a single worker process. Notifications are polled by the web app; live event streaming, notification preferences, quiet hours, escalation, and delivery channels are not implemented yet.
 
+## Billing workflow
+
+Billing staff can create invoices with up to 50 itemized charge lines. The API calculates each line amount and invoice total from quantity and unit price, while retaining support for older description-and-total invoice requests. Invoice records can also hold bill-to contact information, payer/insurer references, optional service and due dates, and notes. Billing patient search is facility-scoped and includes active registered patients who do not yet have a department visit. Cashiers can record partial or full payments; overpayments remain rejected. The workspace provides search and status filters for the latest 100 invoices and supports invoice printing.
+
+Existing invoices remain intact when the new invoice-line and detail tables are created. Tax rules, insurer claim submission, refunds, and accounting exports are not implemented. This is still a development MVP and must not be used with real patient or financial data until it has undergone appropriate security, financial, operational, and regulatory validation.
+
 ## Synthetic demo data
 
 For local workflow testing only, configure `ENVIRONMENT=development` and a local SQLite `DATABASE_URL`, then run:

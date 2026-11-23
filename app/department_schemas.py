@@ -1,8 +1,8 @@
-from datetime import datetime
-from decimal import Decimal
+from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class StockItemCreate(BaseModel):
@@ -42,10 +42,84 @@ class LaboratoryResultCreate(BaseModel):
     result: str = Field(min_length=1, max_length=10000)
 
 
+class InvoiceLineItemCreate(BaseModel):
+    description: str = Field(min_length=1, max_length=240)
+    unit: str = Field(default="service", min_length=1, max_length=40)
+    quantity: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
+    unit_price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+
+    @field_validator("description", "unit")
+    @classmethod
+    def require_nonblank_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("This field cannot be blank.")
+        return normalized
+
+    @model_validator(mode="after")
+    def require_positive_line_amount(self) -> "InvoiceLineItemCreate":
+        amount = (self.quantity * self.unit_price).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+        if amount <= 0 or amount > Decimal("9999999999.99"):
+            raise ValueError("Line amount must be between 0.01 and 9999999999.99.")
+        return self
+
+
 class InvoiceCreate(BaseModel):
     patient_id: str
-    description: str = Field(min_length=1, max_length=240)
-    total_amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    description: str | None = Field(default=None, min_length=1, max_length=240)
+    total_amount: Decimal | None = Field(
+        default=None,
+        gt=0,
+        max_digits=12,
+        decimal_places=2,
+    )
+    items: list[InvoiceLineItemCreate] = Field(default_factory=list, max_length=50)
+    bill_to_name: str | None = Field(default=None, max_length=160)
+    bill_to_phone: str | None = Field(default=None, max_length=32)
+    payer_type: Literal["self_pay", "insurance", "other"] = "self_pay"
+    insurer_name: str | None = Field(default=None, max_length=160)
+    payer_reference: str | None = Field(default=None, max_length=80)
+    service_date: date | None = None
+    due_date: date | None = None
+    notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("description")
+    @classmethod
+    def normalize_invoice_description(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Description cannot be blank.")
+        return normalized
+
+    @model_validator(mode="after")
+    def require_invoice_amount(self) -> "InvoiceCreate":
+        if not self.items and (not self.description or self.total_amount is None):
+            raise ValueError(
+                "Provide itemized charges or a description and total amount."
+            )
+        if self.items and self.total_amount is not None:
+            total = sum(
+                (
+                    (item.quantity * item.unit_price).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP,
+                    )
+                    for item in self.items
+                ),
+                Decimal("0.00"),
+            )
+            if total > Decimal("9999999999.99"):
+                raise ValueError("Invoice total is too large.")
+            if self.total_amount != total:
+                raise ValueError("Invoice total must match the itemized charges.")
+        elif self.total_amount and self.total_amount > Decimal("9999999999.99"):
+            raise ValueError("Invoice total is too large.")
+        return self
 
 
 class PaymentCreate(BaseModel):

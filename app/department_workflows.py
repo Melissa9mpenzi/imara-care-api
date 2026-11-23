@@ -1,12 +1,12 @@
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from pydantic import ValidationError
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.config import settings
 from app.database import get_db
@@ -24,6 +24,8 @@ from app.department_schemas import (
 from app.models import (
     AuditEvent,
     BillingInvoice,
+    BillingInvoiceDetails,
+    BillingInvoiceLine,
     Department,
     BillingPayment,
     Facility,
@@ -117,19 +119,20 @@ def patient_summary(patient: Patient) -> dict:
         "first_name": patient.first_name,
         "last_name": patient.last_name,
         "other_names": patient.other_names,
+        "phone": patient.phone,
     }
 
 
 def _department_patient_ids(facility_id: str, department_id: str, code: str):
+    if code == "BILL":
+        return select(Patient.id).where(Patient.facility_id == facility_id)
     patient_ids = select(Visit.patient_id).where(
         Visit.facility_id == facility_id,
     )
-    if code != "BILL":
-        patient_ids = patient_ids.where(Visit.department_id == department_id)
+    patient_ids = patient_ids.where(Visit.department_id == department_id)
     department_orders = {
         "PHARM": MedicationOrder,
         "LAB": LaboratoryOrder,
-        "BILL": BillingInvoice,
         "THR": TheatreProcedure,
     }
     order_model = department_orders.get(code)
@@ -208,6 +211,39 @@ def invoice_summary(
         "invoice_number": invoice.invoice_number,
         "patient": patient_summary(invoice.patient),
         "description": invoice.description,
+        "items": [
+            {
+                "id": item.id,
+                "description": item.description,
+                "unit": item.unit,
+                "quantity": str(item.quantity),
+                "unit_price": str(item.unit_price),
+                "amount": str(item.amount),
+            }
+            for item in invoice.items
+        ],
+        "billing_details": (
+            {
+                "bill_to_name": invoice.billing_details.bill_to_name,
+                "bill_to_phone": invoice.billing_details.bill_to_phone,
+                "payer_type": invoice.billing_details.payer_type,
+                "insurer_name": invoice.billing_details.insurer_name,
+                "payer_reference": invoice.billing_details.payer_reference,
+                "service_date": (
+                    invoice.billing_details.service_date.isoformat()
+                    if invoice.billing_details.service_date
+                    else None
+                ),
+                "due_date": (
+                    invoice.billing_details.due_date.isoformat()
+                    if invoice.billing_details.due_date
+                    else None
+                ),
+                "notes": invoice.billing_details.notes,
+            }
+            if invoice.billing_details
+            else None
+        ),
         "total_amount": str(total),
         "paid_amount": str(paid_amount),
         "balance": str(total - paid_amount),
@@ -226,6 +262,13 @@ def invoice_summary(
         "created_by": invoice.created_by,
         "created_at": invoice.created_at.isoformat(),
     }
+
+
+def invoice_line_amount(quantity: Decimal, unit_price: Decimal) -> Decimal:
+    return (quantity * unit_price).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
 
 
 def theatre_procedure_summary(procedure: TheatreProcedure) -> dict:
@@ -1019,7 +1062,11 @@ def list_billing_invoices(
     facility_id = facility_id_for(db)
     invoices = db.scalars(
         select(BillingInvoice)
-        .options(joinedload(BillingInvoice.patient))
+        .options(
+            joinedload(BillingInvoice.patient),
+            selectinload(BillingInvoice.items),
+            joinedload(BillingInvoice.billing_details),
+        )
         .where(BillingInvoice.facility_id == facility_id)
         .order_by(BillingInvoice.created_at.desc())
         .limit(100)
@@ -1059,24 +1106,82 @@ def create_billing_invoice(
     staff = staff_for(request, "BILL", {"billing"})
     facility_id = facility_id_for(db)
     patient = require_patient(db, facility_id, payload.patient_id)
+    if payload.items:
+        line_amounts = [
+            invoice_line_amount(item.quantity, item.unit_price)
+            for item in payload.items
+        ]
+        total_amount = sum(line_amounts, Decimal("0.00"))
+        description = payload.description or (
+            payload.items[0].description
+            if len(payload.items) == 1
+            else f"{payload.items[0].description} + {len(payload.items) - 1} more"
+        )
+    elif payload.total_amount is not None and payload.description:
+        line_amounts = []
+        total_amount = payload.total_amount
+        description = payload.description.strip()
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide itemized charges or a description and total amount.",
+        )
     invoice = BillingInvoice(
         facility_id=facility_id,
         patient_id=patient.id,
         invoice_number=f"INV-{datetime.now(timezone.utc):%Y%m%d}-{uuid4().hex[:8].upper()}",
-        description=payload.description.strip(),
-        total_amount=payload.total_amount,
+        description=description[:240],
+        total_amount=total_amount,
         created_by=staff["id"],
+        items=[
+            BillingInvoiceLine(
+                position=index,
+                description=item.description,
+                unit=item.unit,
+                quantity=item.quantity,
+                unit_price=item.unit_price,
+                amount=line_amounts[index],
+            )
+            for index, item in enumerate(payload.items)
+        ],
+        billing_details=BillingInvoiceDetails(
+            bill_to_name=payload.bill_to_name.strip()
+            if payload.bill_to_name and payload.bill_to_name.strip()
+            else None,
+            bill_to_phone=payload.bill_to_phone.strip()
+            if payload.bill_to_phone and payload.bill_to_phone.strip()
+            else None,
+            payer_type=payload.payer_type,
+            insurer_name=payload.insurer_name.strip()
+            if payload.insurer_name and payload.insurer_name.strip()
+            else None,
+            payer_reference=payload.payer_reference.strip()
+            if payload.payer_reference and payload.payer_reference.strip()
+            else None,
+            service_date=payload.service_date,
+            due_date=payload.due_date,
+            notes=payload.notes.strip() if payload.notes and payload.notes.strip() else None,
+        ),
     )
     db.add(invoice)
     db.flush()
     add_audit(
         db, facility_id, staff["id"], "billing.invoice_created",
-        "billing_invoice", invoice.id, {"amount": str(invoice.total_amount)},
+        "billing_invoice",
+        invoice.id,
+        {
+            "amount": str(invoice.total_amount),
+            "line_count": len(payload.items),
+        },
     )
     db.commit()
     invoice = db.scalar(
         select(BillingInvoice)
-        .options(joinedload(BillingInvoice.patient))
+        .options(
+            joinedload(BillingInvoice.patient),
+            selectinload(BillingInvoice.items),
+            joinedload(BillingInvoice.billing_details),
+        )
         .where(BillingInvoice.id == invoice.id)
     )
     return invoice_summary(invoice)
@@ -1128,7 +1233,11 @@ def record_billing_payment(
     db.commit()
     invoice = db.scalar(
         select(BillingInvoice)
-        .options(joinedload(BillingInvoice.patient))
+        .options(
+            joinedload(BillingInvoice.patient),
+            selectinload(BillingInvoice.items),
+            joinedload(BillingInvoice.billing_details),
+        )
         .where(BillingInvoice.id == invoice_id)
     )
     return invoice_summary(invoice, paid_amount)
