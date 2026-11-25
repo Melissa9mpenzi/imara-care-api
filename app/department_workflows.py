@@ -124,7 +124,7 @@ def patient_summary(patient: Patient) -> dict:
 
 
 def _department_patient_ids(facility_id: str, department_id: str, code: str):
-    if code == "BILL":
+    if code in {"BILL", "PHARM"}:
         return select(Patient.id).where(Patient.facility_id == facility_id)
     patient_ids = select(Visit.patient_id).where(
         Visit.facility_id == facility_id,

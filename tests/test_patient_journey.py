@@ -378,6 +378,21 @@ def test_department_head_only_sees_patients_and_queue_in_assigned_department(
     assert client.get("/api/v1/queues?status=all").status_code == 403
 
 
+def test_pharmacist_can_search_active_facility_patients_without_pharmacy_visit(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "pharmacist", "PHARM")
+
+    response = client.get(
+        "/api/v1/departments/patients?department_code=PHARM&q=amina"
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == [patient["id"]]
+
+
 def test_specialist_roles_cannot_access_general_patients_or_other_departments(
     client: TestClient,
     monkeypatch,
