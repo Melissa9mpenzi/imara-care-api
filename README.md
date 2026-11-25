@@ -35,7 +35,7 @@ FACILITY_NAME=Imara Care Clinic
 FACILITY_CODE=IM
 ```
 
-Use a persistent hosted PostgreSQL database for `DATABASE_URL`; do not rely on the function's local SQLite file, which is not persistent. The service accepts `postgres://` and `postgresql://` URLs and normalizes them to the installed psycopg 3 SQLAlchemy driver. It creates its clinical tables and initial facility/departments on startup. Keep the existing authentication tables in the `auth` schema intact when sharing the frontend's database. Once deployed, set the frontend project's `NEXT_PUBLIC_API_URL` to the backend deployment URL followed by `/api/v1` and redeploy the frontend. The public `/api/v1/health` endpoint can be used to verify service availability.
+Use a persistent hosted PostgreSQL database for `DATABASE_URL`; do not rely on the function's local SQLite file, which is not persistent. The service accepts `postgres://` and `postgresql://` URLs and normalizes them to the installed psycopg 3 SQLAlchemy driver. It creates its clinical tables and initial facility/departments on startup. Keep the existing authentication tables in the `auth` schema intact when sharing the frontend's database. Production frontend builds use `https://imara-care-api.vercel.app/api/v1`; local development can override the API base with `NEXT_PUBLIC_API_URL`. The public `/api/v1/health` endpoint can be used to verify service availability.
 
 The following connection example is for the project's Docker database; for a standalone PostgreSQL Server, follow the setup below:
 
