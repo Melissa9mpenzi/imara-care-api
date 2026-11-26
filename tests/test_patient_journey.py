@@ -74,7 +74,12 @@ def client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
 def test_health_is_public_but_staff_api_requires_a_facility_session(client: TestClient):
     client.headers.pop("Authorization")
     assert client.get("/api/v1/health").status_code == 200
-    assert client.get("/api/v1/facility").status_code == 401
+    response = client.get(
+        "/api/v1/facility",
+        headers={"Origin": settings.frontend_origin},
+    )
+    assert response.status_code == 401
+    assert response.headers["access-control-allow-origin"] == settings.frontend_origin
 
 
 def test_staff_session_cannot_access_another_facility(client: TestClient, monkeypatch):
