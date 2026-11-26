@@ -165,6 +165,7 @@ app.add_middleware(StaffAuthenticationMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],
+    allow_origin_regex=r"^https://imara-care-(?:[a-z0-9]+|git-[a-z0-9-]+)-melissa-sharon-lokoromas-projects\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

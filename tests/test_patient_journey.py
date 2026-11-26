@@ -82,6 +82,35 @@ def test_health_is_public_but_staff_api_requires_a_facility_session(client: Test
     assert response.headers["access-control-allow-origin"] == settings.frontend_origin
 
 
+def test_pharmacy_import_preflight_allows_project_deployment_origin(client: TestClient):
+    origin = (
+        "https://imara-care-jyeeg19zh-melissa-sharon-lokoromas-projects.vercel.app"
+    )
+    response = client.options(
+        "/api/v1/pharmacy/stock/import?preview=true",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+def test_pharmacy_import_preflight_rejects_unrelated_vercel_origin(client: TestClient):
+    response = client.options(
+        "/api/v1/pharmacy/stock/import?preview=true",
+        headers={
+            "Origin": "https://imara-care-preview-attacker.vercel.app",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert response.status_code == 400
+    assert "access-control-allow-origin" not in response.headers
+
+
 def test_staff_session_cannot_access_another_facility(client: TestClient, monkeypatch):
     monkeypatch.setattr(
         security,
