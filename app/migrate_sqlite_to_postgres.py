@@ -2,12 +2,14 @@ import argparse
 from itertools import islice
 from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.engine import URL
 
 from app import models as _models
 from app.config import settings
-from app.database import Base
+from app.database import Base, build_engine
 
 
 def migrate(source_path: Path, target_url: str) -> dict[str, int]:
@@ -17,7 +19,7 @@ def migrate(source_path: Path, target_url: str) -> dict[str, int]:
     source_engine = create_engine(
         URL.create("sqlite", database=str(source_path.resolve()))
     )
-    target_engine = create_engine(target_url, pool_pre_ping=True)
+    target_engine = build_engine(target_url)
 
     try:
         if target_engine.dialect.name != "postgresql":
@@ -43,7 +45,14 @@ def migrate(source_path: Path, target_url: str) -> dict[str, int]:
                     "Found tables: " + ", ".join(existing_target_tables)
                 )
 
-            Base.metadata.create_all(bind=target)
+            project_root = Path(__file__).resolve().parents[1]
+            migration_config = Config(str(project_root / "alembic.ini"))
+            migration_config.set_main_option(
+                "script_location",
+                str(project_root / "migrations"),
+            )
+            migration_config.attributes["connection"] = target
+            command.upgrade(migration_config, "head")
             for table in expected_tables:
                 rows = source.execute(select(table)).mappings()
                 copied[table.name] = 0

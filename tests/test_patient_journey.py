@@ -1,18 +1,18 @@
 from collections.abc import Generator
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 
 from openpyxl import Workbook
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app.database import build_engine, get_db
+from app.database import Base, build_engine, get_db
 from app import main
 from app import security
 from app.config import settings
-from app.models import Notification, Reminder, ReminderOccurrence
+from app.models import JobRun, MedicationStockBatch, Notification, Reminder, ReminderOccurrence
 from app.reminder_worker import process_due_occurrences
 
 
@@ -48,7 +48,6 @@ def client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
         with test_session_factory() as session:
             yield session
 
-    monkeypatch.setattr(main, "engine", test_engine)
     monkeypatch.setattr(main, "SessionLocal", test_session_factory)
     monkeypatch.setattr(
         security,
@@ -63,6 +62,8 @@ def client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
         },
     )
     main.app.dependency_overrides[get_db] = override_get_db
+    Base.metadata.create_all(bind=test_engine)
+    main.initialize_database()
     with TestClient(main.app) as test_client:
         test_client.headers["Authorization"] = "Bearer test-token"
         yield test_client
@@ -484,6 +485,9 @@ def test_pharmacy_orders_only_deduct_stock_when_successfully_dispensed(
             "quantity_on_hand": 10,
             "reorder_level": 2,
             "unit_price": "100.00",
+            "batch_number": "AMX-001",
+            "expires_on": "2028-12-31",
+            "reference": "DELIVERY-AMX-001",
         },
     )
     assert stock.status_code == 201
@@ -523,15 +527,19 @@ def test_pharmacy_stock_spreadsheet_import_requires_restock_confirmation_and_ref
             "form": "tablet",
             "unit": "tablet",
             "quantity_on_hand": 8,
+            "batch_number": "IBU-OPEN-01",
+            "expires_on": "2028-12-31",
+            "reference": "DELIVERY-IBU-001",
         },
     )
     assert existing.status_code == 201
     content = (
-        "name,strength,form,unit,quantity_on_hand,reorder_level,unit_price\n"
-        "Ibuprofen,200 mg,tablet,tablet,5,3,100\n"
-        "Paracetamol,500 mg,tablet,tablet,12,4,50\n"
-        "Paracetamol,500 mg,tablet,tablet,2,4,50\n"
-        "Aspirin,75 mg,tablet,tablet,0,2,25\n"
+        "name,strength,form,unit,quantity_on_hand,reorder_level,unit_price,batch_number,expires_on\n"
+        "Ibuprofen,200 mg,tablet,tablet,5,3,100,IBU-NEW-02,2028-12-31\n"
+        "Paracetamol,500 mg,tablet,tablet,12,4,50,PAR-NEW-01,2028-12-31\n"
+        "Paracetamol,500 mg,tablet,tablet,2,4,50,PAR-NEW-02,2029-12-31\n"
+        "Paracetamol,500 mg,tablet,tablet,12,4,50,PAR-NEW-01,2028-12-31\n"
+        "Aspirin,75 mg,tablet,tablet,0,2,25,,\n"
     ).encode()
     upload = {"file": ("stock.csv", content, "text/csv")}
     reference = "DELIVERY-2026-001"
@@ -563,15 +571,129 @@ def test_pharmacy_stock_spreadsheet_import_requires_restock_confirmation_and_ref
     assert imported.status_code == 200
     assert imported.json()["created"] == 1
     assert imported.json()["restocked"] == 1
-    assert sorted(item["quantity_on_hand"] for item in client.get(
+    imported_stock = client.get(
         "/api/v1/pharmacy/stock"
-    ).json()) == [12, 13]
+    ).json()
+    assert sorted(item["quantity_on_hand"] for item in imported_stock) == [13, 14]
+    paracetamol = next(item for item in imported_stock if item["name"] == "Paracetamol")
+    assert len(paracetamol["batches"]) == 2
     reused_reference = client.post(
         "/api/v1/pharmacy/stock/import?preview=true",
         data={"reference": reference},
         files=upload,
     )
     assert reused_reference.status_code == 409
+
+
+def test_pharmacy_dispensing_uses_earliest_expiry_batch_first(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "pharmacist", "PHARM")
+    item = client.post(
+        "/api/v1/pharmacy/stock",
+        json={
+            "name": "Demo medicine",
+            "strength": "10 mg",
+            "form": "tablet",
+            "unit": "tablet",
+            "quantity_on_hand": 5,
+            "batch_number": "EARLY-LOT",
+            "expires_on": (date.today() + timedelta(days=30)).isoformat(),
+            "reference": "DELIVERY-EARLY",
+        },
+    )
+    assert item.status_code == 201
+    received = client.post(
+        f"/api/v1/pharmacy/stock/{item.json()['id']}/receive",
+        json={
+            "quantity": 10,
+            "batch_number": "LATE-LOT",
+            "expires_on": (date.today() + timedelta(days=90)).isoformat(),
+            "reference": "DELIVERY-LATE",
+        },
+    )
+    assert received.status_code == 200
+
+    set_staff_role(monkeypatch, "clinician", "OPD")
+    order = client.post(
+        "/api/v1/pharmacy/orders",
+        json={
+            "patient_id": patient["id"],
+            "stock_item_id": item.json()["id"],
+            "dosage": "1 tablet",
+            "frequency": "once daily",
+            "quantity": 7,
+        },
+    )
+    assert order.status_code == 201
+
+    set_staff_role(monkeypatch, "pharmacist", "PHARM")
+    dispensed = client.post(f"/api/v1/pharmacy/orders/{order.json()['id']}/dispense")
+    assert dispensed.status_code == 200
+    stock = client.get("/api/v1/pharmacy/stock").json()[0]
+    assert stock["quantity_on_hand"] == 8
+    assert stock["available_quantity"] == 8
+    assert stock["batches"] == [{
+        "batch_number": "LATE-LOT",
+        "expires_on": (date.today() + timedelta(days=90)).isoformat(),
+        "quantity_remaining": 8,
+        "expired": False,
+    }]
+
+
+def test_expired_stock_is_excluded_from_available_quantity_and_dispensing(
+    client: TestClient,
+    monkeypatch,
+):
+    patient = register_patient(client)
+    set_staff_role(monkeypatch, "pharmacist", "PHARM")
+    item = client.post(
+        "/api/v1/pharmacy/stock",
+        json={
+            "name": "Expired medicine",
+            "strength": "5 mg",
+            "form": "tablet",
+            "unit": "tablet",
+            "quantity_on_hand": 5,
+            "batch_number": "EXP-LOT",
+            "expires_on": (date.today() + timedelta(days=30)).isoformat(),
+            "reference": "DELIVERY-EXP",
+        },
+    )
+    assert item.status_code == 201
+    with main.SessionLocal() as db:
+        batch = db.scalar(
+            select(MedicationStockBatch).where(
+                MedicationStockBatch.stock_item_id == item.json()["id"]
+            )
+        )
+        assert batch is not None
+        batch.expires_on = date.today() - timedelta(days=1)
+        db.commit()
+
+    stock = client.get("/api/v1/pharmacy/stock").json()[0]
+    assert stock["quantity_on_hand"] == 5
+    assert stock["available_quantity"] == 0
+    assert stock["expired_quantity"] == 5
+
+    set_staff_role(monkeypatch, "clinician", "OPD")
+    order = client.post(
+        "/api/v1/pharmacy/orders",
+        json={
+            "patient_id": patient["id"],
+            "stock_item_id": item.json()["id"],
+            "dosage": "1 tablet",
+            "frequency": "once daily",
+            "quantity": 1,
+        },
+    )
+    assert order.status_code == 201
+    set_staff_role(monkeypatch, "pharmacist", "PHARM")
+    refused = client.post(f"/api/v1/pharmacy/orders/{order.json()['id']}/dispense")
+    assert refused.status_code == 409
+    assert "unexpired" in refused.json()["detail"]
 
 
 def test_laboratory_result_can_only_be_recorded_once_by_lab_staff(
@@ -592,15 +714,47 @@ def test_laboratory_result_can_only_be_recorded_once_by_lab_staff(
     assert order.status_code == 201
 
     set_staff_role(monkeypatch, "laboratory", "LAB", mfa=False)
+    not_collected = client.post(
+        f"/api/v1/laboratory/orders/{order.json()['id']}/result",
+        json={"result": "Within expected range."},
+    )
+    assert not_collected.status_code == 409
+
+    collected = client.patch(
+        f"/api/v1/laboratory/orders/{order.json()['id']}/sample",
+        json={"status": "collected"},
+    )
+    assert collected.status_code == 200
+    assert collected.json()["sample_status"] == "collected"
+
     result = client.post(
         f"/api/v1/laboratory/orders/{order.json()['id']}/result",
         json={"result": "Within expected range."},
     )
     assert result.status_code == 200
     assert result.json()["status"] == "resulted"
+    assert result.json()["sample_status"] == "resulted"
+    assert result.json()["review_status"] == "awaiting_review"
     assert client.post(
         f"/api/v1/laboratory/orders/{order.json()['id']}/result",
         json={"result": "Changed result."},
+    ).status_code == 409
+    assert client.post(
+        f"/api/v1/laboratory/orders/{order.json()['id']}/review",
+        json={"notes": "Reviewed by the attending clinician."},
+    ).status_code == 403
+
+    set_staff_role(monkeypatch, "clinician", "OPD")
+    reviewed = client.post(
+        f"/api/v1/laboratory/orders/{order.json()['id']}/review",
+        json={"notes": "Reviewed by the attending clinician."},
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.json()["review_status"] == "reviewed"
+    assert reviewed.json()["reviewed_by"] == "test-staff"
+    assert client.post(
+        f"/api/v1/laboratory/orders/{order.json()['id']}/review",
+        json={},
     ).status_code == 409
 
 
@@ -693,6 +847,59 @@ def test_billing_itemizes_charges_and_prefills_registered_patient_contact(
     assert listed.status_code == 200
     assert listed.json()[0]["patient"]["phone"] == "+256700100200"
     assert listed.json()[0]["items"] == created["items"]
+    assert listed.json()[0]["insurance_claim"] is None
+
+    claim = client.post(
+        f"/api/v1/billing/invoices/{created['id']}/claims",
+        json={"notes": "Prepared for insurer submission."},
+    )
+    assert claim.status_code == 201
+    assert claim.json()["status"] == "draft"
+    assert claim.json()["insurer_name"] == "Imara Health"
+    assert client.post(
+        f"/api/v1/billing/invoices/{created['id']}/claims",
+        json={},
+    ).status_code == 409
+
+    claim_id = claim.json()["id"]
+    set_staff_role(monkeypatch, "cashier", "BILL", mfa=False)
+    assert client.patch(
+        f"/api/v1/billing/claims/{claim_id}",
+        json={"status": "submitted"},
+    ).status_code == 403
+    set_staff_role(monkeypatch, "billing", "BILL", mfa=False)
+    submitted = client.patch(
+        f"/api/v1/billing/claims/{claim_id}",
+        json={
+            "status": "submitted",
+            "external_claim_reference": "INS-CLAIM-001",
+        },
+    )
+    assert submitted.status_code == 200
+    assert submitted.json()["external_claim_reference"] == "INS-CLAIM-001"
+    approved = client.patch(
+        f"/api/v1/billing/claims/{claim_id}",
+        json={"status": "approved"},
+    )
+    assert approved.status_code == 200
+    assert client.patch(
+        f"/api/v1/billing/claims/{claim_id}",
+        json={"status": "paid"},
+    ).status_code == 409
+
+    payment = client.post(
+        f"/api/v1/billing/invoices/{created['id']}/payments",
+        json={"amount": "200.12", "method": "insurance", "reference": "SETTLE-001"},
+    )
+    assert payment.status_code == 201
+    assert payment.json()["payments"][0]["receipt_number"].startswith("RCT-")
+    paid_claim = client.patch(
+        f"/api/v1/billing/claims/{claim_id}",
+        json={"status": "paid"},
+    )
+    assert paid_claim.status_code == 200
+    assert paid_claim.json()["status"] == "paid"
+    assert client.get("/api/v1/billing/invoices").json()[0]["insurance_claim"]["status"] == "paid"
 
 
 def test_billing_itemized_invoice_rejects_a_mismatched_total(
@@ -875,6 +1082,92 @@ def test_patient_checkin_triage_and_queue_call(client: TestClient):
     ]
 
 
+@pytest.mark.parametrize(
+    ("target_code", "expected_visit_status", "expected_queue_number"),
+    [
+        ("LAB", "awaiting_lab", "LAB-001"),
+        ("PHARM", "awaiting_pharmacy", "PH-001"),
+    ],
+)
+def test_reception_can_handoff_an_open_visit_to_lab_or_pharmacy(
+    client: TestClient,
+    monkeypatch,
+    target_code: str,
+    expected_visit_status: str,
+    expected_queue_number: str,
+):
+    departments = {
+        department["code"]: department
+        for department in client.get("/api/v1/facility").json()["departments"]
+    }
+    patient = register_patient(client)
+    checked_in = client.post(
+        "/api/v1/visits/checkin",
+        json={
+            "patient_id": patient["id"],
+            "department_id": departments["OPD"]["id"],
+            "reason": "Persistent headache",
+            "expected_payment_method": "cash",
+        },
+    )
+    assert checked_in.status_code == 201
+
+    set_staff_role(monkeypatch, "reception", mfa=False)
+    response = client.post(
+        f"/api/v1/visits/{checked_in.json()['visit_id']}/handoff",
+        json={"target_department_code": target_code, "reason": "Request follow-up"},
+    )
+    assert response.status_code == 201
+    result = response.json()
+    assert result["target_visit"]["department"]["code"] == target_code
+    assert result["target_visit"]["reason"] == "Request follow-up"
+    assert result["target_visit"]["queue_number"] == expected_queue_number
+
+    outpatient_queue = client.get(
+        "/api/v1/queues",
+        params={"department_id": departments["OPD"]["id"], "status": "all"},
+    ).json()
+    assert outpatient_queue[0]["status"] == "completed"
+    assert outpatient_queue[0]["visit_status"] == expected_visit_status
+    set_staff_role(monkeypatch, "facility_admin")
+    audit = client.get("/api/v1/audit").json()
+    assert any(event["action"] == "visit.handed_off" for event in audit)
+
+    duplicate = client.post(
+        f"/api/v1/visits/{checked_in.json()['visit_id']}/handoff",
+        json={"target_department_code": target_code, "reason": "Repeat referral"},
+    )
+    assert duplicate.status_code == 409
+
+
+def test_nurse_cannot_handoff_a_visit_outside_assigned_department(
+    client: TestClient,
+    monkeypatch,
+):
+    departments = {
+        department["code"]: department
+        for department in client.get("/api/v1/facility").json()["departments"]
+    }
+    patient = register_patient(client)
+    checked_in = client.post(
+        "/api/v1/visits/checkin",
+        json={
+            "patient_id": patient["id"],
+            "department_id": departments["OPD"]["id"],
+            "reason": "Persistent headache",
+            "expected_payment_method": "cash",
+        },
+    )
+    assert checked_in.status_code == 201
+
+    set_staff_role(monkeypatch, "nurse", "LAB")
+    response = client.post(
+        f"/api/v1/visits/{checked_in.json()['visit_id']}/handoff",
+        json={"target_department_code": "PHARM", "reason": "Dispense medication"},
+    )
+    assert response.status_code == 403
+
+
 def test_patient_search_duplicate_prevention_and_dob_requirement(client: TestClient):
     patient = register_patient(client)
 
@@ -973,6 +1266,119 @@ def test_reminder_fires_once_and_notification_can_be_marked_read(client: TestCli
         assert db.query(Reminder).filter_by(id=reminder_id).one().status == "scheduled"
         assert db.query(ReminderOccurrence).filter_by(reminder_id=reminder_id).one().status == "fired"
         assert db.query(Notification).filter_by(id=notification["id"]).count() == 1
+
+
+def test_reminder_scheduler_endpoint_records_a_run_and_exposes_admin_status(
+    client: TestClient,
+    monkeypatch,
+):
+    cron_secret = "test-cron-secret-with-at-least-32-chars"
+    monkeypatch.setattr(settings, "cron_secret", cron_secret)
+    unauthorized = client.post(
+        "/api/v1/internal/jobs/reminders",
+        headers={"Authorization": "Bearer wrong-secret"},
+    )
+    assert unauthorized.status_code == 401
+
+    triggered = client.post(
+        "/api/v1/internal/jobs/reminders",
+        headers={"Authorization": f"Bearer {cron_secret}"},
+    )
+    assert triggered.status_code == 200
+    assert triggered.json()["status"] == "succeeded"
+    assert triggered.json()["processed"] == 0
+    assert triggered.json()["finished_at"].endswith("+00:00")
+
+    status_response = client.get("/api/v1/operations/reminders")
+    assert status_response.status_code == 200
+    assert status_response.json()["last_run"]["status"] == "succeeded"
+    assert status_response.json()["stale"] is False
+    assert status_response.json()["last_run"]["finished_at"].endswith("+00:00")
+    with main.SessionLocal() as db:
+        assert db.query(JobRun).filter_by(name="reminders").count() == 1
+
+
+def test_reminder_scheduler_endpoint_fails_closed_when_secret_is_unset(
+    client: TestClient,
+    monkeypatch,
+):
+    for secret in ("", "too-short"):
+        monkeypatch.setattr(settings, "cron_secret", secret)
+        response = client.post("/api/v1/internal/jobs/reminders")
+        assert response.status_code == 503
+
+
+def test_reminder_health_is_privileged_and_stale_without_recent_run(
+    client: TestClient,
+    monkeypatch,
+):
+    from app import security
+
+    unauthorized_staff = {
+        "sub": "clinician",
+        "facilityId": settings.facility_code,
+        "staffRole": "clinician",
+        "mfa": True,
+    }
+    monkeypatch.setattr(security, "verify_access_token", lambda token: unauthorized_staff)
+    assert client.get("/api/v1/operations/reminders").status_code == 403
+
+    monkeypatch.setattr(
+        security,
+        "verify_access_token",
+        lambda token: {
+            "sub": "test-admin",
+            "facilityId": settings.facility_code,
+            "staffRole": "facility_admin",
+            "mfa": True,
+        },
+    )
+    response = client.get("/api/v1/operations/reminders")
+    assert response.status_code == 200
+    assert response.json()["last_run"] is None
+    assert response.json()["stale"] is True
+
+
+def test_reminder_health_marks_a_slow_heartbeat_stale(client: TestClient):
+    with main.SessionLocal() as db:
+        finished_at = datetime.now(timezone.utc) - timedelta(minutes=6)
+        db.add(
+            JobRun(
+                name="reminders",
+                status="succeeded",
+                started_at=finished_at - timedelta(seconds=2),
+                finished_at=finished_at,
+                processed_count=1,
+            )
+        )
+        db.commit()
+
+    response = client.get("/api/v1/operations/reminders")
+    assert response.status_code == 200
+    assert response.json()["stale"] is True
+
+
+def test_failed_reminder_job_is_recorded_before_error_is_raised(monkeypatch):
+    from app import reminder_worker
+
+    test_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=test_engine)
+    test_session_factory = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+
+    def fail_processing(db):
+        raise RuntimeError("sensitive exception details are not persisted")
+
+    monkeypatch.setattr(reminder_worker, "process_due_occurrences", fail_processing)
+    try:
+        with test_session_factory() as db:
+            with pytest.raises(RuntimeError):
+                reminder_worker.run_reminder_job(db)
+            failed_run = db.query(JobRun).filter_by(name="reminders").one()
+            assert failed_run.status == "failed"
+            assert failed_run.error == "RuntimeError"
+            assert "sensitive" not in (failed_run.error or "")
+    finally:
+        test_engine.dispose()
 
 
 def test_reminders_are_private_and_reject_invalid_schedule(client: TestClient, monkeypatch):

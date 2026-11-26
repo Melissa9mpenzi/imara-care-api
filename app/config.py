@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:3000"
     auth_issuer: str = "http://localhost:3000"
     auth_jwks_url: str = "http://localhost:3000/api/auth/jwks"
+    cron_secret: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

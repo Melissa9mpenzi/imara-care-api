@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
-from app.database import Base, SessionLocal, engine, get_db
+from app.database import SessionLocal, get_db
 from app.models import (
     Appointment,
     AuditEvent,
@@ -19,6 +19,7 @@ from app.models import (
     QueueEntry,
     TriageRecord,
     Visit,
+    VisitHandoff,
 )
 from app.schemas import (
     AppointmentCreate,
@@ -29,8 +30,10 @@ from app.schemas import (
     PatientRead,
     PatientUpdate,
     TriageCreate,
+    VisitHandoffCreate,
 )
 from app.reminders import router as reminders_router
+from app.internal_jobs import router as internal_jobs_router
 from app.security import StaffAuthenticationMiddleware
 from app.spreadsheet_imports import read_spreadsheet_rows
 from app.department_workflows import router as department_workflows_router
@@ -121,7 +124,6 @@ def audit(
 
 
 def initialize_database() -> None:
-    Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         facility = db.scalar(select(Facility).where(Facility.code == settings.facility_code))
         if facility is None:
@@ -168,13 +170,9 @@ app.add_middleware(
 )
 app.add_middleware(StaffAuthenticationMiddleware)
 app.include_router(reminders_router)
+app.include_router(internal_jobs_router)
 app.include_router(department_workflows_router)
 app.include_router(support_requests_router)
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    initialize_database()
 
 
 def get_facility(db: Session) -> Facility:
@@ -1108,6 +1106,160 @@ def check_in(payload: CheckInCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(entry)
     return queue_summary(entry)
+
+
+@app.post("/api/v1/visits/{visit_id}/handoff", status_code=status.HTTP_201_CREATED)
+def handoff_visit(
+    visit_id: str,
+    payload: VisitHandoffCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    staff = request.state.staff_user
+    if staff["role"] not in {
+        "admin",
+        "facility_admin",
+        "medical_director",
+        "reception",
+        "nurse",
+        "clinician",
+    }:
+        raise HTTPException(status_code=403, detail="This account cannot hand off visits.")
+    facility = db.scalar(
+        select(Facility)
+        .where(Facility.code == settings.facility_code)
+        .with_for_update()
+    )
+    if facility is None:
+        raise HTTPException(status_code=503, detail="Facility setup is incomplete.")
+    visit = db.scalar(
+        select(Visit)
+        .options(joinedload(Visit.patient), joinedload(Visit.department))
+        .where(
+            Visit.id == visit_id,
+            Visit.facility_id == facility.id,
+        )
+        .with_for_update()
+    )
+    if visit is None:
+        raise HTTPException(status_code=404, detail="Visit not found.")
+    require_nurse_department(request, db, facility.id, visit.department_id)
+    if visit.status not in OPEN_VISIT_STATUSES:
+        raise HTTPException(status_code=409, detail="Only open visits can be handed off.")
+    target_department = db.scalar(
+        select(Department).where(
+            Department.facility_id == facility.id,
+            Department.code == payload.target_department_code,
+            Department.active.is_(True),
+        )
+    )
+    if target_department is None:
+        raise HTTPException(status_code=404, detail="Destination department is unavailable.")
+    if visit.department_id == target_department.id:
+        raise HTTPException(status_code=409, detail="Visit is already assigned to that department.")
+    existing_destination = db.scalar(
+        select(Visit.id).where(
+            Visit.facility_id == facility.id,
+            Visit.patient_id == visit.patient_id,
+            Visit.department_id == target_department.id,
+            Visit.status.in_(OPEN_VISIT_STATUSES),
+        )
+    )
+    if existing_destination:
+        raise HTTPException(
+            status_code=409,
+            detail="This patient already has an open visit in the destination department.",
+        )
+
+    today = date.today()
+    day_start = datetime.combine(today, time.min, tzinfo=timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    visits_today = db.scalar(
+        select(func.count(Visit.id)).where(
+            Visit.facility_id == facility.id,
+            Visit.visit_date >= day_start,
+            Visit.visit_date < day_end,
+        )
+    ) or 0
+    target_visit = Visit(
+        facility_id=facility.id,
+        patient_id=visit.patient_id,
+        department_id=target_department.id,
+        visit_number=f"V-{today:%Y%m%d}-{visits_today + 1:04d}",
+        reason=payload.reason,
+        expected_payment_method=visit.expected_payment_method,
+        status="waiting",
+    )
+    db.add(target_visit)
+    db.flush()
+    queue_count = db.scalar(
+        select(func.count(QueueEntry.id)).where(
+            QueueEntry.facility_id == facility.id,
+            QueueEntry.department_id == target_department.id,
+            QueueEntry.queue_date == today,
+        )
+    ) or 0
+    target_entry = QueueEntry(
+        facility_id=facility.id,
+        visit_id=target_visit.id,
+        department_id=target_department.id,
+        queue_number=f"{target_department.queue_prefix}-{queue_count + 1:03d}",
+        queue_date=today,
+        priority=visit.queue_entry.priority if visit.queue_entry else "routine",
+    )
+    db.add(target_entry)
+    source_entry = db.scalar(
+        select(QueueEntry).where(
+            QueueEntry.facility_id == facility.id,
+            QueueEntry.visit_id == visit.id,
+        )
+    )
+    if source_entry and source_entry.status in {"waiting", "in_service"}:
+        source_entry.status = "completed"
+    visit.status = (
+        "awaiting_pharmacy"
+        if payload.target_department_code == "PHARM"
+        else "awaiting_lab"
+    )
+    handoff = VisitHandoff(
+        facility_id=facility.id,
+        source_visit_id=visit.id,
+        target_visit_id=target_visit.id,
+        source_department_id=visit.department_id,
+        target_department_id=target_department.id,
+        reason=payload.reason,
+        created_by=staff["id"],
+    )
+    db.add(handoff)
+    db.flush()
+    audit(
+        db,
+        facility.id,
+        "visit.handed_off",
+        "visit_handoff",
+        handoff.id,
+        {
+            "source_visit_id": visit.id,
+            "target_visit_id": target_visit.id,
+            "target_department": target_department.code,
+        },
+        actor=staff["id"],
+    )
+    db.commit()
+    target_entry = db.scalar(
+        select(QueueEntry)
+        .options(
+            joinedload(QueueEntry.visit).joinedload(Visit.patient),
+            joinedload(QueueEntry.visit).joinedload(Visit.department),
+            joinedload(QueueEntry.visit).joinedload(Visit.triage),
+        )
+        .where(QueueEntry.id == target_entry.id)
+    )
+    return {
+        "handoff_id": handoff.id,
+        "source_visit_id": visit.id,
+        "target_visit": queue_summary(target_entry),
+    }
 
 
 @app.get("/api/v1/queues")

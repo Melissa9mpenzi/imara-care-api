@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import SessionLocal
-from app.models import Notification, Reminder, ReminderOccurrence
+from app.models import JobRun, Notification, Reminder, ReminderOccurrence, utc_now
 
 
 logger = logging.getLogger("imara.reminders")
@@ -113,13 +113,59 @@ def process_due_occurrences(db: Session, now: datetime | None = None) -> int:
     return processed
 
 
+def run_reminder_job(db: Session) -> dict:
+    job_run = JobRun(
+        name="reminders",
+        status="running",
+        started_at=utc_now(),
+        processed_count=0,
+    )
+    db.add(job_run)
+    db.commit()
+    db.refresh(job_run)
+
+    try:
+        processed = process_due_occurrences(db)
+        job_run.status = "succeeded"
+        job_run.processed_count = processed
+        job_run.finished_at = utc_now()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        job_run = db.get(JobRun, job_run.id)
+        if job_run is not None:
+            job_run.status = "failed"
+            job_run.finished_at = utc_now()
+            job_run.error = type(exc).__name__
+            db.commit()
+        logger.exception("Reminder job failed.")
+        raise
+
+    started_at = job_run.started_at
+    finished_at = job_run.finished_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    if finished_at is not None and finished_at.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=timezone.utc)
+    return {
+        "id": job_run.id,
+        "status": job_run.status,
+        "processed": job_run.processed_count,
+        "started_at": started_at,
+        "finished_at": finished_at,
+    }
+
+
 def run_worker(poll_seconds: int = 60) -> None:
     logger.info("Reminder worker started; polling every %s seconds.", poll_seconds)
     while True:
-        with SessionLocal() as db:
-            processed = process_due_occurrences(db)
-        if processed:
-            logger.info("Delivered %s reminder notification(s).", processed)
+        try:
+            with SessionLocal() as db:
+                result = run_reminder_job(db)
+            if result["processed"]:
+                logger.info("Delivered %s reminder notification(s).", result["processed"])
+        except Exception:
+            logger.exception("Reminder worker iteration failed; it will retry.")
         time.sleep(poll_seconds)
 
 

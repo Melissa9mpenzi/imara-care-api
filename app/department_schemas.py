@@ -13,11 +13,50 @@ class StockItemCreate(BaseModel):
     quantity_on_hand: int = Field(default=0, ge=0, le=1_000_000)
     reorder_level: int = Field(default=0, ge=0, le=1_000_000)
     unit_price: Decimal = Field(default=Decimal("0.00"), ge=0, max_digits=12, decimal_places=2)
+    batch_number: str | None = Field(default=None, min_length=1, max_length=100)
+    expires_on: date | None = None
+    reference: str | None = Field(default=None, min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def require_batch_for_opening_stock(self) -> "StockItemCreate":
+        if self.quantity_on_hand and (not self.batch_number or not self.expires_on):
+            raise ValueError("Batch number and expiry date are required for opening stock.")
+        if self.quantity_on_hand and not self.reference:
+            raise ValueError("A stock receipt reference is required for opening stock.")
+        if self.batch_number and not self.expires_on:
+            raise ValueError("An expiry date is required when a batch number is provided.")
+        if self.expires_on and self.expires_on < date.today():
+            raise ValueError("Expired stock cannot be received.")
+        for field_name in ("batch_number", "reference"):
+            value = getattr(self, field_name)
+            if value is not None:
+                normalized = value.strip()
+                if not normalized:
+                    raise ValueError(f"{field_name.replace('_', ' ').capitalize()} cannot be blank.")
+                setattr(self, field_name, normalized)
+        return self
 
 
 class StockReceive(BaseModel):
     quantity: int = Field(gt=0, le=1_000_000)
-    reference: str | None = Field(default=None, max_length=240)
+    batch_number: str = Field(min_length=1, max_length=100)
+    expires_on: date
+    reference: str = Field(min_length=1, max_length=240)
+
+    @field_validator("batch_number", "reference")
+    @classmethod
+    def require_nonblank_receipt_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("This field cannot be blank.")
+        return normalized
+
+    @field_validator("expires_on")
+    @classmethod
+    def reject_expired_stock(cls, value: date) -> date:
+        if value < date.today():
+            raise ValueError("Expired stock cannot be received.")
+        return value
 
 
 class MedicationOrderCreate(BaseModel):
@@ -40,6 +79,14 @@ class LaboratoryOrderCreate(BaseModel):
 
 class LaboratoryResultCreate(BaseModel):
     result: str = Field(min_length=1, max_length=10000)
+
+
+class LaboratorySampleStatusUpdate(BaseModel):
+    status: Literal["collected", "processing", "rejected"]
+
+
+class LaboratoryResultReviewCreate(BaseModel):
+    notes: str | None = Field(default=None, max_length=2000)
 
 
 class InvoiceLineItemCreate(BaseModel):
@@ -126,6 +173,40 @@ class PaymentCreate(BaseModel):
     amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
     method: Literal["cash", "insurance", "mobile_money", "bank_transfer", "other"]
     reference: str | None = Field(default=None, max_length=120)
+
+    @field_validator("reference")
+    @classmethod
+    def normalize_payment_reference(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class InsuranceClaimCreate(BaseModel):
+    notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("notes")
+    @classmethod
+    def normalize_claim_notes(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class InsuranceClaimUpdate(BaseModel):
+    status: Literal["submitted", "approved", "denied", "paid"]
+    external_claim_reference: str | None = Field(default=None, max_length=120)
+    notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("external_claim_reference", "notes")
+    @classmethod
+    def normalize_optional_claim_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 class TheatreProcedureCreate(BaseModel):

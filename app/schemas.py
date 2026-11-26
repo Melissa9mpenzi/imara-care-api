@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 PaymentMethod = Literal["cash", "insurance", "mobile_money", "bank_transfer", "other"]
@@ -108,6 +108,19 @@ class CheckInCreate(BaseModel):
     reason: str = Field(min_length=1, max_length=240)
     expected_payment_method: PaymentMethod = "cash"
     priority: Priority = "routine"
+
+
+class VisitHandoffCreate(BaseModel):
+    target_department_code: Literal["PHARM", "LAB"]
+    reason: str = Field(min_length=1, max_length=240)
+
+    @field_validator("reason")
+    @classmethod
+    def require_handoff_reason(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("A handoff reason is required.")
+        return normalized
 
 
 class TriageCreate(BaseModel):

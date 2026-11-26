@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from uuid import uuid4
 
@@ -12,8 +12,12 @@ from app.config import settings
 from app.database import get_db
 from app.department_schemas import (
     InvoiceCreate,
+    InsuranceClaimCreate,
+    InsuranceClaimUpdate,
     LaboratoryOrderCreate,
+    LaboratoryResultReviewCreate,
     LaboratoryResultCreate,
+    LaboratorySampleStatusUpdate,
     MedicationOrderCreate,
     PaymentCreate,
     StockItemCreate,
@@ -26,13 +30,18 @@ from app.models import (
     BillingInvoice,
     BillingInvoiceDetails,
     BillingInvoiceLine,
+    BillingPaymentReceipt,
     Department,
     BillingPayment,
     Facility,
     LaboratoryOrder,
+    LaboratoryResultReview,
+    LaboratorySample,
     MedicationOrder,
+    MedicationStockBatch,
     MedicationStockItem,
     MedicationStockMovement,
+    InsuranceClaim,
     Patient,
     QueueEntry,
     TheatreProcedure,
@@ -63,6 +72,11 @@ STOCK_IMPORT_ALIASES = {
     "reorder_at": "reorder_level",
     "unit_price": "unit_price",
     "price": "unit_price",
+    "batch_number": "batch_number",
+    "lot_number": "batch_number",
+    "expires_on": "expires_on",
+    "expiry_date": "expires_on",
+    "expiration_date": "expires_on",
 }
 
 
@@ -146,6 +160,19 @@ def _department_patient_ids(facility_id: str, department_id: str, code: str):
 
 
 def stock_summary(item: MedicationStockItem) -> dict:
+    today = datetime.now(timezone.utc).date()
+    batches = sorted(item.batches, key=lambda batch: (batch.expires_on, batch.received_at))
+    available_quantity = sum(
+        batch.quantity_remaining
+        for batch in batches
+        if batch.expires_on >= today
+    )
+    expired_quantity = sum(
+        batch.quantity_remaining
+        for batch in batches
+        if batch.expires_on < today
+    )
+    tracked_quantity = sum(batch.quantity_remaining for batch in batches)
     return {
         "id": item.id,
         "name": item.name,
@@ -153,12 +180,81 @@ def stock_summary(item: MedicationStockItem) -> dict:
         "form": item.form,
         "unit": item.unit,
         "quantity_on_hand": item.quantity_on_hand,
+        "available_quantity": available_quantity,
+        "expired_quantity": expired_quantity,
+        "untracked_quantity": max(item.quantity_on_hand - tracked_quantity, 0),
         "reorder_level": item.reorder_level,
         "unit_price": str(item.unit_price),
-        "low_stock": item.quantity_on_hand <= item.reorder_level,
+        "low_stock": available_quantity <= item.reorder_level,
         "active": item.active,
+        "batches": [
+            {
+                "batch_number": batch.batch_number,
+                "expires_on": batch.expires_on.isoformat(),
+                "quantity_remaining": batch.quantity_remaining,
+                "expired": batch.expires_on < today,
+            }
+            for batch in batches
+            if batch.quantity_remaining > 0
+        ],
         "updated_at": item.updated_at.isoformat(),
     }
+
+
+def record_stock_batch(
+    db: Session,
+    facility_id: str,
+    item: MedicationStockItem,
+    *,
+    quantity: int,
+    batch_number: str,
+    expires_on: date,
+    reference: str,
+    staff_id: str,
+) -> None:
+    if expires_on < datetime.now(timezone.utc).date():
+        raise HTTPException(status_code=422, detail="Expired stock cannot be received.")
+    batch_number = batch_number.strip()
+    receipt_reference = reference.strip()
+    batch = db.scalar(
+        select(MedicationStockBatch)
+        .where(
+            MedicationStockBatch.facility_id == facility_id,
+            MedicationStockBatch.stock_item_id == item.id,
+            func.lower(MedicationStockBatch.batch_number) == batch_number.casefold(),
+        )
+        .with_for_update()
+    )
+    if batch is not None:
+        if batch.expires_on != expires_on:
+            raise HTTPException(
+                status_code=409,
+                detail="This batch number is already recorded with a different expiry date.",
+            )
+        batch.quantity_received += quantity
+        batch.quantity_remaining += quantity
+    else:
+        db.add(
+            MedicationStockBatch(
+                facility_id=facility_id,
+                stock_item_id=item.id,
+                batch_number=batch_number,
+                expires_on=expires_on,
+                quantity_received=quantity,
+                quantity_remaining=quantity,
+                received_by=staff_id,
+            )
+        )
+    db.add(
+        MedicationStockMovement(
+            facility_id=facility_id,
+            stock_item_id=item.id,
+            movement_type="received",
+            quantity=quantity,
+            reference=receipt_reference,
+            created_by=staff_id,
+        )
+    )
 
 
 def medication_order_summary(order: MedicationOrder) -> dict:
@@ -184,6 +280,14 @@ def medication_order_summary(order: MedicationOrder) -> dict:
 
 
 def laboratory_order_summary(order: LaboratoryOrder) -> dict:
+    sample_status = order.sample.status if order.sample else "awaiting_collection"
+    review_status = (
+        "reviewed"
+        if order.review
+        else "awaiting_review"
+        if order.status == "resulted"
+        else "not_ready"
+    )
     return {
         "id": order.id,
         "patient": patient_summary(order.patient),
@@ -197,6 +301,20 @@ def laboratory_order_summary(order: LaboratoryOrder) -> dict:
         "resulted_by": order.resulted_by,
         "created_at": order.created_at.isoformat(),
         "resulted_at": order.resulted_at.isoformat() if order.resulted_at else None,
+        "sample_status": sample_status,
+        "sample_collected_at": (
+            order.sample.collected_at.isoformat()
+            if order.sample and order.sample.collected_at
+            else None
+        ),
+        "review_status": review_status,
+        "reviewed_by": order.review.reviewed_by if order.review else None,
+        "reviewed_at": (
+            order.review.reviewed_at.isoformat()
+            if order.review
+            else None
+        ),
+        "review_notes": order.review.notes if order.review else None,
     }
 
 
@@ -256,11 +374,37 @@ def invoice_summary(
                 "reference": payment.reference,
                 "recorded_by": payment.recorded_by,
                 "paid_at": payment.paid_at.isoformat(),
+                "receipt_number": (
+                    payment.receipt.receipt_number if payment.receipt else None
+                ),
             }
             for payment in (payments or [])
         ],
+        "insurance_claim": (
+            insurance_claim_summary(invoice.insurance_claim)
+            if invoice.insurance_claim
+            else None
+        ),
         "created_by": invoice.created_by,
         "created_at": invoice.created_at.isoformat(),
+    }
+
+
+def insurance_claim_summary(claim: InsuranceClaim) -> dict:
+    return {
+        "id": claim.id,
+        "claim_number": claim.claim_number,
+        "status": claim.status,
+        "insurer_name": claim.invoice.billing_details.insurer_name,
+        "payer_reference": claim.invoice.billing_details.payer_reference,
+        "external_claim_reference": claim.external_claim_reference,
+        "notes": claim.notes,
+        "created_by": claim.created_by,
+        "updated_by": claim.updated_by,
+        "submitted_at": claim.submitted_at.isoformat() if claim.submitted_at else None,
+        "resolved_at": claim.resolved_at.isoformat() if claim.resolved_at else None,
+        "created_at": claim.created_at.isoformat(),
+        "updated_at": claim.updated_at.isoformat(),
     }
 
 
@@ -299,6 +443,7 @@ def list_pharmacy_stock(
     facility_id = facility_id_for(db)
     items = db.scalars(
         select(MedicationStockItem)
+        .options(selectinload(MedicationStockItem.batches))
         .where(
             MedicationStockItem.facility_id == facility_id,
             MedicationStockItem.active.is_(True),
@@ -472,14 +617,15 @@ def create_pharmacy_stock(
             detail="This medication strength and form already exist in stock.",
         ) from error
     if payload.quantity_on_hand:
-        db.add(
-            MedicationStockMovement(
-                facility_id=facility_id,
-                stock_item_id=item.id,
-                movement_type="received",
-                quantity=payload.quantity_on_hand,
-                created_by=staff["id"],
-            )
+        record_stock_batch(
+            db,
+            facility_id,
+            item,
+            quantity=payload.quantity_on_hand,
+            batch_number=payload.batch_number or "",
+            expires_on=payload.expires_on or date.min,
+            reference=payload.reference or "",
+            staff_id=staff["id"],
         )
     add_audit(
         db, facility_id, staff["id"], "pharmacy.stock_created",
@@ -490,12 +636,13 @@ def create_pharmacy_stock(
     return stock_summary(item)
 
 
-def normalize_stock_import_row(row: dict) -> StockItemCreate:
+def normalize_stock_import_row(row: dict, reference: str) -> StockItemCreate:
     values = {
         key: value.strip() if isinstance(value, str) else value
         for key, value in row.items()
         if key != "_row_number"
     }
+    values["reference"] = f"Bulk stock import: {reference}"
     return StockItemCreate.model_validate(values)
 
 
@@ -522,7 +669,15 @@ def import_pharmacy_stock(
     rows = read_spreadsheet_rows(
         file,
         aliases=STOCK_IMPORT_ALIASES,
-        required_columns={"name", "strength", "form", "unit", "quantity_on_hand"},
+        required_columns={
+            "name",
+            "strength",
+            "form",
+            "unit",
+            "quantity_on_hand",
+            "batch_number",
+            "expires_on",
+        },
     )
     receipt_reference = f"Bulk stock import: {reference}"
     facility_query = select(Facility).where(Facility.code == settings.facility_code)
@@ -552,20 +707,32 @@ def import_pharmacy_stock(
             MedicationStockItem.facility_id == facility.id,
         )
     ).all()
+    existing_batches = db.scalars(
+        select(MedicationStockBatch).where(
+            MedicationStockBatch.facility_id == facility.id,
+        )
+    ).all()
     items_by_key: dict[tuple[str, str, str], list[MedicationStockItem]] = {}
     for item in existing_items:
         key = (item.name.strip().casefold(), item.strength.strip().casefold(), item.form.strip().casefold())
         items_by_key.setdefault(key, []).append(item)
+    batch_expiries = {
+        (batch.stock_item_id, batch.batch_number.strip().casefold()): batch.expires_on
+        for batch in existing_batches
+    }
 
-    seen_file_keys: set[tuple[str, str, str]] = set()
-    parsed_rows: list[tuple[int, StockItemCreate, str, MedicationStockItem | None]] = []
+    seen_file_keys: set[tuple[str, str, str, str]] = set()
+    new_product_keys: set[tuple[str, str, str]] = set()
+    parsed_rows: list[
+        tuple[int, StockItemCreate, str, MedicationStockItem | None, tuple[str, str, str]]
+    ] = []
     results: list[dict] = []
     restock_count = 0
     new_count = 0
 
     for row_number, raw_row in rows:
         try:
-            payload = normalize_stock_import_row(raw_row)
+            payload = normalize_stock_import_row(raw_row, reference)
         except ValidationError as error:
             results.append({
                 "row": row_number,
@@ -586,15 +753,16 @@ def import_pharmacy_stock(
             continue
 
         key = (payload.name.casefold(), payload.strength.casefold(), payload.form.casefold())
-        if key in seen_file_keys:
+        batch_key = (*key, (payload.batch_number or "").casefold())
+        if batch_key in seen_file_keys:
             results.append({
                 "row": row_number,
                 "display": display,
                 "status": "duplicate",
-                "message": "This medicine appears more than once in the file; only the first row is considered.",
+                "message": "This medicine batch appears more than once in the file; only the first row is considered.",
             })
             continue
-        seen_file_keys.add(key)
+        seen_file_keys.add(batch_key)
 
         matches = items_by_key.get(key, [])
         if len(matches) > 1:
@@ -622,6 +790,18 @@ def import_pharmacy_stock(
                 "message": "The stock unit differs from the existing item; no stock was changed.",
             })
             continue
+        if existing is not None:
+            batch_expiry = batch_expiries.get(
+                (existing.id, (payload.batch_number or "").casefold())
+            )
+            if batch_expiry is not None and batch_expiry != payload.expires_on:
+                results.append({
+                    "row": row_number,
+                    "display": display,
+                    "status": "invalid",
+                    "message": "This batch number is already recorded with a different expiry date.",
+                })
+                continue
 
         if existing is not None:
             restock_count += 1
@@ -631,10 +811,12 @@ def import_pharmacy_stock(
                 "price and reorder level will not change."
             )
         else:
-            new_count += 1
+            if key not in new_product_keys:
+                new_count += 1
+                new_product_keys.add(key)
             status_label = "new"
-            message = "A new stock item will be created."
-        parsed_rows.append((row_number, payload, status_label, existing))
+            message = "A new stock item and expiry-tracked batch will be created."
+        parsed_rows.append((row_number, payload, status_label, existing, key))
         results.append({
             "row": row_number,
             "display": display,
@@ -662,41 +844,50 @@ def import_pharmacy_stock(
 
     committed_results: list[dict] = []
     try:
-        for row_number, payload, row_status, existing in parsed_rows:
+        new_items_by_key: dict[tuple[str, str, str], MedicationStockItem] = {}
+        for row_number, payload, row_status, existing, item_key in parsed_rows:
             if row_status == "new":
-                item = MedicationStockItem(
-                    facility_id=facility.id,
-                    name=payload.name,
-                    strength=payload.strength,
-                    form=payload.form,
-                    unit=payload.unit,
-                    quantity_on_hand=payload.quantity_on_hand,
-                    reorder_level=payload.reorder_level,
-                    unit_price=payload.unit_price,
-                )
-                db.add(item)
-                db.flush()
-                add_audit(
+                item = new_items_by_key.get(item_key)
+                is_new_item = item is None
+                if item is None:
+                    item = MedicationStockItem(
+                        facility_id=facility.id,
+                        name=payload.name,
+                        strength=payload.strength,
+                        form=payload.form,
+                        unit=payload.unit,
+                        quantity_on_hand=0,
+                        reorder_level=payload.reorder_level,
+                        unit_price=payload.unit_price,
+                    )
+                    db.add(item)
+                    db.flush()
+                    new_items_by_key[item_key] = item
+                item.quantity_on_hand += payload.quantity_on_hand
+                item.updated_at = utc_now()
+                record_stock_batch(
                     db,
                     facility.id,
-                    staff["id"],
-                    "pharmacy.stock_created",
-                    "medication_stock_item",
-                    item.id,
-                    {"source": "spreadsheet_import", "reference": reference},
+                    item,
+                    quantity=payload.quantity_on_hand,
+                    batch_number=payload.batch_number or "",
+                    expires_on=payload.expires_on or date.min,
+                    reference=receipt_reference,
+                    staff_id=staff["id"],
                 )
-                status_label = "created"
-                if payload.quantity_on_hand:
-                    db.add(
-                        MedicationStockMovement(
-                            facility_id=facility.id,
-                            stock_item_id=item.id,
-                            movement_type="received",
-                            quantity=payload.quantity_on_hand,
-                            reference=receipt_reference,
-                            created_by=staff["id"],
-                        )
+                if is_new_item:
+                    add_audit(
+                        db,
+                        facility.id,
+                        staff["id"],
+                        "pharmacy.stock_created",
+                        "medication_stock_item",
+                        item.id,
+                        {"source": "spreadsheet_import", "reference": reference},
                     )
+                    status_label = "created"
+                else:
+                    status_label = "imported"
             else:
                 if existing is None:
                     raise HTTPException(
@@ -719,15 +910,15 @@ def import_pharmacy_stock(
                     )
                 item.quantity_on_hand += payload.quantity_on_hand
                 item.updated_at = utc_now()
-                db.add(
-                    MedicationStockMovement(
-                        facility_id=facility.id,
-                        stock_item_id=item.id,
-                        movement_type="received",
-                        quantity=payload.quantity_on_hand,
-                        reference=receipt_reference,
-                        created_by=staff["id"],
-                    )
+                record_stock_batch(
+                    db,
+                    facility.id,
+                    item,
+                    quantity=payload.quantity_on_hand,
+                    batch_number=payload.batch_number or "",
+                    expires_on=payload.expires_on or date.min,
+                    reference=receipt_reference,
+                    staff_id=staff["id"],
                 )
                 add_audit(
                     db,
@@ -801,15 +992,15 @@ def receive_pharmacy_stock(
         raise HTTPException(status_code=404, detail="Medication stock item not found.")
     item.quantity_on_hand += payload.quantity
     item.updated_at = utc_now()
-    db.add(
-        MedicationStockMovement(
-            facility_id=facility_id,
-            stock_item_id=item.id,
-            movement_type="received",
-            quantity=payload.quantity,
-            reference=payload.reference,
-            created_by=staff["id"],
-        )
+    record_stock_batch(
+        db,
+        facility_id,
+        item,
+        quantity=payload.quantity,
+        batch_number=payload.batch_number,
+        expires_on=payload.expires_on,
+        reference=payload.reference,
+        staff_id=staff["id"],
     )
     add_audit(
         db, facility_id, staff["id"], "pharmacy.stock_received",
@@ -911,6 +1102,24 @@ def dispense_medication_order(
         raise HTTPException(status_code=404, detail="Medication order not found.")
     if order.status != "requested":
         raise HTTPException(status_code=409, detail="Only requested orders can be dispensed.")
+    today = datetime.now(timezone.utc).date()
+    batches = db.scalars(
+        select(MedicationStockBatch)
+        .where(
+            MedicationStockBatch.facility_id == facility_id,
+            MedicationStockBatch.stock_item_id == order.stock_item_id,
+            MedicationStockBatch.quantity_remaining > 0,
+            MedicationStockBatch.expires_on >= today,
+        )
+        .order_by(MedicationStockBatch.expires_on, MedicationStockBatch.received_at)
+        .with_for_update()
+    ).all()
+    available_quantity = sum(batch.quantity_remaining for batch in batches)
+    if available_quantity < order.quantity:
+        raise HTTPException(
+            status_code=409,
+            detail="There is not enough unexpired, batch-tracked stock to dispense this order.",
+        )
     result = db.execute(
         update(MedicationStockItem)
         .where(
@@ -929,6 +1138,13 @@ def dispense_medication_order(
             status_code=409,
             detail="There is not enough stock to dispense this order.",
         )
+    quantity_to_dispense = order.quantity
+    for batch in batches:
+        taken = min(batch.quantity_remaining, quantity_to_dispense)
+        batch.quantity_remaining -= taken
+        quantity_to_dispense -= taken
+        if quantity_to_dispense == 0:
+            break
     order.status = "dispensed"
     order.dispensed_by = staff["id"]
     order.dispensed_at = utc_now()
@@ -969,7 +1185,11 @@ def list_laboratory_orders(
     facility_id = facility_id_for(db)
     orders = db.scalars(
         select(LaboratoryOrder)
-        .options(joinedload(LaboratoryOrder.patient))
+        .options(
+            joinedload(LaboratoryOrder.patient),
+            joinedload(LaboratoryOrder.sample),
+            joinedload(LaboratoryOrder.review),
+        )
         .where(LaboratoryOrder.facility_id == facility_id)
         .order_by(LaboratoryOrder.created_at.desc())
         .limit(100)
@@ -1002,6 +1222,13 @@ def create_laboratory_order(
     )
     db.add(order)
     db.flush()
+    db.add(
+        LaboratorySample(
+            facility_id=facility_id,
+            order_id=order.id,
+            updated_by=staff["id"],
+        )
+    )
     add_audit(
         db, facility_id, staff["id"], "laboratory.order_created",
         "laboratory_order", order.id,
@@ -1009,7 +1236,11 @@ def create_laboratory_order(
     db.commit()
     order = db.scalar(
         select(LaboratoryOrder)
-        .options(joinedload(LaboratoryOrder.patient))
+        .options(
+            joinedload(LaboratoryOrder.patient),
+            joinedload(LaboratoryOrder.sample),
+            joinedload(LaboratoryOrder.review),
+        )
         .where(LaboratoryOrder.id == order.id)
     )
     return laboratory_order_summary(order)
@@ -1036,10 +1267,18 @@ def record_laboratory_result(
         raise HTTPException(status_code=404, detail="Laboratory order not found.")
     if order.status != "requested":
         raise HTTPException(status_code=409, detail="Only requested tests can receive a result.")
+    if order.sample is None or order.sample.status not in {"collected", "processing"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Record sample collection before entering a result.",
+        )
     order.result = payload.result.strip()
     order.status = "resulted"
     order.resulted_by = staff["id"]
     order.resulted_at = utc_now()
+    order.sample.status = "resulted"
+    order.sample.updated_by = staff["id"]
+    order.sample.updated_at = utc_now()
     add_audit(
         db, facility_id, staff["id"], "laboratory.result_recorded",
         "laboratory_order", order.id,
@@ -1047,7 +1286,155 @@ def record_laboratory_result(
     db.commit()
     order = db.scalar(
         select(LaboratoryOrder)
-        .options(joinedload(LaboratoryOrder.patient))
+        .options(
+            joinedload(LaboratoryOrder.patient),
+            joinedload(LaboratoryOrder.sample),
+            joinedload(LaboratoryOrder.review),
+        )
+        .where(LaboratoryOrder.id == order_id)
+    )
+    return laboratory_order_summary(order)
+
+
+@router.patch("/laboratory/orders/{order_id}/sample")
+def update_laboratory_sample_status(
+    order_id: str,
+    payload: LaboratorySampleStatusUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict:
+    staff = staff_for(request, "LAB", {"laboratory"})
+    facility_id = facility_id_for(db)
+    order = db.scalar(
+        select(LaboratoryOrder)
+        .options(joinedload(LaboratoryOrder.sample))
+        .where(
+            LaboratoryOrder.id == order_id,
+            LaboratoryOrder.facility_id == facility_id,
+        )
+        .with_for_update()
+    )
+    if order is None:
+        raise HTTPException(status_code=404, detail="Laboratory order not found.")
+    if order.status != "requested":
+        raise HTTPException(
+            status_code=409,
+            detail="Sample status cannot change after a result is entered.",
+        )
+    sample = order.sample
+    if sample is None:
+        sample = LaboratorySample(
+            facility_id=facility_id,
+            order_id=order.id,
+            status="awaiting_collection",
+            updated_by=staff["id"],
+        )
+        db.add(sample)
+        db.flush()
+    allowed_transitions = {
+        "awaiting_collection": {"collected", "rejected"},
+        "collected": {"processing", "rejected"},
+        "processing": {"rejected"},
+    }
+    if payload.status not in allowed_transitions.get(sample.status, set()):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Sample cannot move from {sample.status} to {payload.status}.",
+        )
+    sample.status = payload.status
+    sample.updated_by = staff["id"]
+    sample.updated_at = utc_now()
+    if payload.status == "collected":
+        sample.collected_by = staff["id"]
+        sample.collected_at = sample.updated_at
+    add_audit(
+        db,
+        facility_id,
+        staff["id"],
+        "laboratory.sample_status_updated",
+        "laboratory_order",
+        order.id,
+        {"status": payload.status},
+    )
+    db.commit()
+    order = db.scalar(
+        select(LaboratoryOrder)
+        .options(
+            joinedload(LaboratoryOrder.patient),
+            joinedload(LaboratoryOrder.sample),
+            joinedload(LaboratoryOrder.review),
+        )
+        .where(LaboratoryOrder.id == order_id)
+    )
+    return laboratory_order_summary(order)
+
+
+@router.post("/laboratory/orders/{order_id}/review")
+def review_laboratory_result(
+    order_id: str,
+    payload: LaboratoryResultReviewCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict:
+    staff = staff_for(request, "LAB", {"laboratory"}, allow_clinical=True)
+    if staff.get("role") not in {
+        "clinician",
+        "admin",
+        "facility_admin",
+        "medical_director",
+    }:
+        raise HTTPException(
+            status_code=403,
+            detail="Only a clinician or facility administrator can review a result.",
+        )
+    facility_id = facility_id_for(db)
+    order = db.scalar(
+        select(LaboratoryOrder)
+        .options(
+            joinedload(LaboratoryOrder.patient),
+            joinedload(LaboratoryOrder.sample),
+            joinedload(LaboratoryOrder.review),
+        )
+        .where(
+            LaboratoryOrder.id == order_id,
+            LaboratoryOrder.facility_id == facility_id,
+        )
+        .with_for_update()
+    )
+    if order is None:
+        raise HTTPException(status_code=404, detail="Laboratory order not found.")
+    if order.status != "resulted" or not order.result:
+        raise HTTPException(
+            status_code=409,
+            detail="Only a recorded laboratory result can be reviewed.",
+        )
+    if order.review is not None:
+        raise HTTPException(status_code=409, detail="This laboratory result has already been reviewed.")
+    review = LaboratoryResultReview(
+        facility_id=facility_id,
+        order_id=order.id,
+        reviewed_by=staff["id"],
+        notes=payload.notes.strip() if payload.notes and payload.notes.strip() else None,
+    )
+    order.review = review
+    db.add(review)
+    add_audit(
+        db,
+        facility_id,
+        staff["id"],
+        "laboratory.result_reviewed",
+        "laboratory_order",
+        order.id,
+        {"notes_recorded": bool(review.notes)},
+    )
+    db.commit()
+    order = db.scalar(
+        select(LaboratoryOrder)
+        .options(
+            joinedload(LaboratoryOrder.patient),
+            joinedload(LaboratoryOrder.sample),
+            joinedload(LaboratoryOrder.review),
+        )
         .where(LaboratoryOrder.id == order_id)
     )
     return laboratory_order_summary(order)
@@ -1066,6 +1453,7 @@ def list_billing_invoices(
             joinedload(BillingInvoice.patient),
             selectinload(BillingInvoice.items),
             joinedload(BillingInvoice.billing_details),
+            joinedload(BillingInvoice.insurance_claim),
         )
         .where(BillingInvoice.facility_id == facility_id)
         .order_by(BillingInvoice.created_at.desc())
@@ -1081,6 +1469,7 @@ def list_billing_invoices(
     paid_by_invoice = {invoice_id: amount for invoice_id, amount in paid_rows}
     payment_rows = db.scalars(
         select(BillingPayment)
+        .options(selectinload(BillingPayment.receipt))
         .where(BillingPayment.invoice_id.in_([invoice.id for invoice in invoices]))
         .order_by(BillingPayment.paid_at)
     ).all()
@@ -1095,6 +1484,144 @@ def list_billing_invoices(
         )
         for invoice in invoices
     ]
+
+
+@router.post(
+    "/billing/invoices/{invoice_id}/claims",
+    status_code=status.HTTP_201_CREATED,
+)
+def create_insurance_claim(
+    invoice_id: str,
+    payload: InsuranceClaimCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict:
+    staff = staff_for(request, "BILL", {"billing"})
+    facility_id = facility_id_for(db)
+    invoice = db.scalar(
+        select(BillingInvoice)
+        .options(joinedload(BillingInvoice.billing_details))
+        .where(
+            BillingInvoice.id == invoice_id,
+            BillingInvoice.facility_id == facility_id,
+        )
+        .with_for_update()
+    )
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+    if not invoice.billing_details or invoice.billing_details.payer_type != "insurance":
+        raise HTTPException(status_code=409, detail="Only insurance invoices can have claims.")
+    if db.scalar(
+        select(InsuranceClaim.id).where(InsuranceClaim.invoice_id == invoice.id)
+    ):
+        raise HTTPException(status_code=409, detail="A claim already exists for this invoice.")
+
+    claim = InsuranceClaim(
+        facility_id=facility_id,
+        invoice_id=invoice.id,
+        claim_number=f"CLM-{datetime.now(timezone.utc):%Y%m%d}-{uuid4().hex[:8].upper()}",
+        notes=payload.notes,
+        created_by=staff["id"],
+    )
+    db.add(claim)
+    db.flush()
+    add_audit(
+        db,
+        facility_id,
+        staff["id"],
+        "billing.claim_created",
+        "insurance_claim",
+        claim.id,
+        {"invoice_id": invoice.id, "claim_number": claim.claim_number},
+    )
+    db.commit()
+    claim = db.scalar(
+        select(InsuranceClaim)
+        .options(
+            joinedload(InsuranceClaim.invoice).joinedload(BillingInvoice.billing_details)
+        )
+        .where(InsuranceClaim.id == claim.id)
+    )
+    return insurance_claim_summary(claim)
+
+
+@router.patch("/billing/claims/{claim_id}")
+def update_insurance_claim(
+    claim_id: str,
+    payload: InsuranceClaimUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict:
+    staff = staff_for(request, "BILL", {"billing"})
+    facility_id = facility_id_for(db)
+    claim = db.scalar(
+        select(InsuranceClaim)
+        .options(joinedload(InsuranceClaim.invoice))
+        .where(
+            InsuranceClaim.id == claim_id,
+            InsuranceClaim.facility_id == facility_id,
+        )
+        .with_for_update()
+    )
+    if claim is None:
+        raise HTTPException(status_code=404, detail="Insurance claim not found.")
+    transitions = {
+        "draft": {"submitted"},
+        "submitted": {"approved", "denied"},
+        "denied": {"submitted"},
+        "approved": {"paid"},
+    }
+    if payload.status not in transitions.get(claim.status, set()):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Claim cannot move from {claim.status} to {payload.status}.",
+        )
+    if payload.status == "paid":
+        insurance_payment = db.scalar(
+            select(BillingPayment.id)
+            .where(
+                BillingPayment.invoice_id == claim.invoice_id,
+                BillingPayment.facility_id == facility_id,
+                BillingPayment.method == "insurance",
+            )
+            .limit(1)
+        )
+        if insurance_payment is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Record an insurer payment before marking this claim paid.",
+            )
+    previous_status = claim.status
+    claim.status = payload.status
+    if payload.external_claim_reference is not None:
+        claim.external_claim_reference = payload.external_claim_reference
+    if payload.notes is not None:
+        claim.notes = payload.notes
+    claim.updated_by = staff["id"]
+    now = datetime.now(timezone.utc)
+    if payload.status == "submitted":
+        claim.submitted_at = now
+        claim.resolved_at = None
+    else:
+        claim.resolved_at = now
+    add_audit(
+        db,
+        facility_id,
+        staff["id"],
+        "billing.claim_status_updated",
+        "insurance_claim",
+        claim.id,
+        {"from": previous_status, "to": claim.status},
+    )
+    db.commit()
+    claim = db.scalar(
+        select(InsuranceClaim)
+        .options(
+            joinedload(InsuranceClaim.invoice).joinedload(BillingInvoice.billing_details)
+        )
+        .where(InsuranceClaim.id == claim.id)
+    )
+    return insurance_claim_summary(claim)
 
 
 @router.post("/billing/invoices", status_code=status.HTTP_201_CREATED)
@@ -1181,6 +1708,7 @@ def create_billing_invoice(
             joinedload(BillingInvoice.patient),
             selectinload(BillingInvoice.items),
             joinedload(BillingInvoice.billing_details),
+            joinedload(BillingInvoice.insurance_claim),
         )
         .where(BillingInvoice.id == invoice.id)
     )
@@ -1222,6 +1750,11 @@ def record_billing_payment(
         method=payload.method,
         reference=payload.reference,
         recorded_by=staff["id"],
+        receipt=BillingPaymentReceipt(
+            facility_id=facility_id,
+            receipt_number=f"RCT-{datetime.now(timezone.utc):%Y%m%d}-{uuid4().hex[:8].upper()}",
+            issued_by=staff["id"],
+        ),
     )
     db.add(payment)
     paid_amount += payload.amount
@@ -1237,10 +1770,17 @@ def record_billing_payment(
             joinedload(BillingInvoice.patient),
             selectinload(BillingInvoice.items),
             joinedload(BillingInvoice.billing_details),
+            joinedload(BillingInvoice.insurance_claim),
         )
         .where(BillingInvoice.id == invoice_id)
     )
-    return invoice_summary(invoice, paid_amount)
+    saved_payments = db.scalars(
+        select(BillingPayment)
+        .options(selectinload(BillingPayment.receipt))
+        .where(BillingPayment.invoice_id == invoice.id)
+        .order_by(BillingPayment.paid_at)
+    ).all()
+    return invoice_summary(invoice, paid_amount, saved_payments)
 
 
 @router.get("/theatre/procedures")

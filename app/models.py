@@ -142,6 +142,24 @@ class Visit(Base):
     triage: Mapped["TriageRecord | None"] = relationship(back_populates="visit", uselist=False)
 
 
+class VisitHandoff(Base):
+    __tablename__ = "visit_handoffs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    source_visit_id: Mapped[str] = mapped_column(ForeignKey("visits.id"), index=True)
+    target_visit_id: Mapped[str] = mapped_column(
+        ForeignKey("visits.id"),
+        unique=True,
+        index=True,
+    )
+    source_department_id: Mapped[str] = mapped_column(ForeignKey("departments.id"))
+    target_department_id: Mapped[str] = mapped_column(ForeignKey("departments.id"))
+    reason: Mapped[str] = mapped_column(String(240), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class QueueEntry(Base):
     __tablename__ = "queue_entries"
     __table_args__ = (
@@ -284,6 +302,21 @@ class Notification(Base):
     reminder_occurrence: Mapped[ReminderOccurrence | None] = relationship()
 
 
+class JobRun(Base):
+    __tablename__ = "job_runs"
+    __table_args__ = (
+        Index("ix_job_run_name_started", "name", "started_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error: Mapped[str | None] = mapped_column(String(160))
+
+
 class SupportRequest(Base):
     __tablename__ = "support_requests"
     __table_args__ = (
@@ -353,6 +386,40 @@ class MedicationStockItem(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
+    batches: Mapped[list["MedicationStockBatch"]] = relationship(
+        back_populates="stock_item",
+        cascade="all, delete-orphan",
+        order_by="MedicationStockBatch.expires_on",
+    )
+
+
+class MedicationStockBatch(Base):
+    __tablename__ = "medication_stock_batches"
+    __table_args__ = (
+        UniqueConstraint(
+            "facility_id",
+            "stock_item_id",
+            "batch_number",
+            name="uq_medication_stock_batch_number",
+        ),
+        CheckConstraint("quantity_received > 0", name="ck_stock_batch_received_positive"),
+        CheckConstraint("quantity_remaining >= 0", name="ck_stock_batch_remaining_nonnegative"),
+        Index("ix_stock_batch_expiry", "facility_id", "stock_item_id", "expires_on"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    stock_item_id: Mapped[str] = mapped_column(
+        ForeignKey("medication_stock_items.id"), index=True
+    )
+    batch_number: Mapped[str] = mapped_column(String(100), nullable=False)
+    expires_on: Mapped[date] = mapped_column(Date, nullable=False)
+    quantity_received: Mapped[int] = mapped_column(Integer, nullable=False)
+    quantity_remaining: Mapped[int] = mapped_column(Integer, nullable=False)
+    received_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    stock_item: Mapped[MedicationStockItem] = relationship(back_populates="batches")
 
 
 class MedicationStockMovement(Base):
@@ -415,6 +482,52 @@ class LaboratoryOrder(Base):
     resulted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     patient: Mapped[Patient] = relationship()
+    sample: Mapped["LaboratorySample | None"] = relationship(
+        back_populates="order",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+    review: Mapped["LaboratoryResultReview | None"] = relationship(
+        back_populates="order",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class LaboratorySample(Base):
+    __tablename__ = "laboratory_samples"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    order_id: Mapped[str] = mapped_column(
+        ForeignKey("laboratory_orders.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(String(24), default="awaiting_collection", nullable=False)
+    collected_by: Mapped[str | None] = mapped_column(String(128))
+    collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    order: Mapped[LaboratoryOrder] = relationship(back_populates="sample")
+
+
+class LaboratoryResultReview(Base):
+    __tablename__ = "laboratory_result_reviews"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    order_id: Mapped[str] = mapped_column(
+        ForeignKey("laboratory_orders.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    reviewed_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    order: Mapped[LaboratoryOrder] = relationship(back_populates="review")
 
 
 class BillingInvoice(Base):
@@ -442,6 +555,11 @@ class BillingInvoice(Base):
         order_by="BillingInvoiceLine.position",
     )
     billing_details: Mapped["BillingInvoiceDetails | None"] = relationship(
+        back_populates="invoice",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+    insurance_claim: Mapped["InsuranceClaim | None"] = relationship(
         back_populates="invoice",
         cascade="all, delete-orphan",
         uselist=False,
@@ -507,6 +625,61 @@ class BillingPayment(Base):
     reference: Mapped[str | None] = mapped_column(String(120))
     recorded_by: Mapped[str] = mapped_column(String(128), nullable=False)
     paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    receipt: Mapped["BillingPaymentReceipt | None"] = relationship(
+        back_populates="payment",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class BillingPaymentReceipt(Base):
+    __tablename__ = "billing_payment_receipts"
+    __table_args__ = (
+        UniqueConstraint("facility_id", "receipt_number", name="uq_billing_receipt_facility_number"),
+    )
+
+    payment_id: Mapped[str] = mapped_column(
+        ForeignKey("billing_payments.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    receipt_number: Mapped[str] = mapped_column(String(32), nullable=False)
+    issued_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    payment: Mapped[BillingPayment] = relationship(back_populates="receipt")
+
+
+class InsuranceClaim(Base):
+    __tablename__ = "insurance_claims"
+    __table_args__ = (
+        UniqueConstraint("facility_id", "claim_number", name="uq_insurance_claim_facility_number"),
+        UniqueConstraint("invoice_id", name="uq_insurance_claim_invoice"),
+        Index("ix_insurance_claim_facility_status", "facility_id", "status", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"), index=True)
+    invoice_id: Mapped[str] = mapped_column(
+        ForeignKey("billing_invoices.id", ondelete="CASCADE"),
+        index=True,
+    )
+    claim_number: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="draft", nullable=False)
+    external_claim_reference: Mapped[str | None] = mapped_column(String(120))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(String(128))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    invoice: Mapped[BillingInvoice] = relationship(back_populates="insurance_claim")
 
 
 class TheatreProcedure(Base):

@@ -39,6 +39,8 @@ SPECIALIST_DEPARTMENTS = {
 
 def role_can_access_api(method: str, path: str, staff: dict) -> bool:
     role = staff["role"]
+    if path == "/api/v1/operations/reminders":
+        return method == "GET" and role in STAFF_ADMIN_ROLES
     if role in STAFF_ADMIN_ROLES:
         return True
 
@@ -66,10 +68,16 @@ def role_can_access_api(method: str, path: str, staff: dict) -> bool:
             "clinician",
         }
 
-    if role == "clinician" and path in {
-        "/api/v1/pharmacy/orders",
-        "/api/v1/laboratory/orders",
-    }:
+    if role == "clinician" and (
+        path in {
+            "/api/v1/pharmacy/orders",
+            "/api/v1/laboratory/orders",
+        }
+        or (
+            re.fullmatch(r"/api/v1/laboratory/orders/[^/]+/review", path)
+            and method == "POST"
+        )
+    ):
         return method in {"GET", "POST"}
 
     if role == "department_head" or role in SPECIALIST_DEPARTMENTS:
@@ -105,6 +113,8 @@ def role_can_access_api(method: str, path: str, staff: dict) -> bool:
         return role == "reception" and method == "PATCH"
     if path == "/api/v1/visits/checkin":
         return role == "reception" and method == "POST"
+    if re.fullmatch(r"/api/v1/visits/[^/]+/handoff", path):
+        return role in {"reception", "nurse", "clinician"} and method == "POST"
     if path == "/api/v1/queues":
         return role in {"reception", "nurse", "clinician"} and method == "GET"
     if re.fullmatch(r"/api/v1/queues/[^/]+/call", path):
@@ -144,6 +154,7 @@ class StaffAuthenticationMiddleware(BaseHTTPMiddleware):
         if (
             not request.url.path.startswith("/api/v1/")
             or request.url.path == "/api/v1/health"
+            or request.url.path == "/api/v1/internal/jobs/reminders"
             or request.method == "OPTIONS"
         ):
             return await call_next(request)
