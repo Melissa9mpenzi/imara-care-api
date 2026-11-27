@@ -40,6 +40,8 @@ FACILITY_CODE=IM
 
 Use a persistent hosted PostgreSQL database for `DATABASE_URL`; do not rely on the function's local SQLite file, which is not persistent. The service accepts `postgres://` and `postgresql://` URLs and normalizes them to the installed psycopg 3 SQLAlchemy driver. Apply schema migrations and seed the facility with `python -m app.bootstrap` as an explicit release step before serving API traffic; the API no longer creates tables or seeds data during startup. Use separate database variables for preview/staging and production, and keep the existing authentication tables in the `auth` schema intact when sharing the frontend's database. Production frontend builds use `https://imara-care-api.vercel.app/api/v1`; local development can override the API base with `NEXT_PUBLIC_API_URL`. The public `/api/v1/health` endpoint can be used to verify service availability.
 
+For a production migration, add the production PostgreSQL connection string as the GitHub Actions repository secret `DATABASE_URL` (Settings → Secrets and variables → Actions). Back up the database, then run **Production database migration** from the repository's Actions tab and explicitly confirm the production run. The workflow applies Alembic migrations, seeds missing facility defaults, and checks for schema drift; it does not print the secret. Never put the connection string in source code or chat.
+
 The following connection example is for the project's Docker database; for a standalone PostgreSQL Server, follow the setup below:
 
 ```text

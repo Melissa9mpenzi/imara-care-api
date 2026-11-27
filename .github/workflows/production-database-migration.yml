@@ -1,0 +1,42 @@
+name: Production database migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_production:
+        description: Confirm that this run may modify the production database
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    if: ${{ inputs.confirm_production }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Apply migrations and verify schema
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ENVIRONMENT: production
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "Configure the DATABASE_URL repository secret before running this workflow."
+            exit 1
+          fi
+          python -m app.bootstrap
+          python -m alembic check
